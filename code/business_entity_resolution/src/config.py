@@ -34,3 +34,9 @@ RANDOM_SEED = 42
 VAL_FRACTION = 0.15             # fraction of S1 entities held out for threshold search
 MAX_BLOCK_SIZE = 5000           # safety cap: skip a blocking key if EITHER side's group exceeds this
 MAX_PAIR_PRODUCT = 2_000_000    # safety cap: skip a blocking key if the join size (n_s1 * n_candidates) exceeds this
+
+# tqdm refresh throttle: some notebook/terminal output panes don't support
+# carriage-return line overwriting, so every refresh becomes a new printed
+# line instead of updating in place. A large mininterval keeps the log
+# readable regardless — fewer refreshes, not fewer printed characters per one.
+TQDM_MININTERVAL = 2.0

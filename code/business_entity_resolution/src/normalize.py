@@ -13,6 +13,8 @@ import unicodedata
 import polars as pl
 from tqdm import tqdm
 
+import config
+
 LEGAL_SUFFIXES = [
     "private limited", "pvt ltd", "pvt. ltd.", "pvt ltd.", "private ltd",
     "limited", "ltd", "llc", "llp", "inc", "incorporated", "corporation",
@@ -45,9 +47,10 @@ def normalize_df(df: pl.DataFrame, label: str = "") -> pl.DataFrame:
     addrs = df["business_address"].to_list()
     tag = f"[{label}] " if label else ""
 
-    norm_names = [_normalize_str(n) for n in tqdm(names, desc=f"{tag}normalize names")]
-    core_names = [_strip_suffixes(n) for n in tqdm(norm_names, desc=f"{tag}strip suffixes")]
-    norm_addrs = [_normalize_str(a) for a in tqdm(addrs, desc=f"{tag}normalize addresses")]
+    tq = dict(mininterval=config.TQDM_MININTERVAL)
+    norm_names = [_normalize_str(n) for n in tqdm(names, desc=f"{tag}normalize names", **tq)]
+    core_names = [_strip_suffixes(n) for n in tqdm(norm_names, desc=f"{tag}strip suffixes", **tq)]
+    norm_addrs = [_normalize_str(a) for a in tqdm(addrs, desc=f"{tag}normalize addresses", **tq)]
 
     return df.with_columns([
         pl.Series("normalized_name", norm_names),

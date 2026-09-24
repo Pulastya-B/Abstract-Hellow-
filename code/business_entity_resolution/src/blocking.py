@@ -19,6 +19,8 @@ embedding ANN yet) — additive layers on top of this.
 import polars as pl
 from tqdm import tqdm
 
+import config
+
 
 def _add_block_keys(df: pl.DataFrame, name_col: str) -> pl.DataFrame:
     tokens = pl.col(name_col).str.split(" ")
@@ -109,13 +111,15 @@ def generate_candidates(
 
     results = []
     countries = s1b["country"].unique().to_list()
-    for country in tqdm(countries, desc="blocking by country"):
+    for country in tqdm(countries, desc="blocking by country", mininterval=config.TQDM_MININTERVAL):
         s1c = s1b.filter(pl.col("country") == country)
         obc = ob.filter(pl.col("country") == country)
         if s1c.height == 0 or obc.height == 0:
             continue
         tqdm.write(f"  country={country}: {s1c.height:,} S1 x {obc.height:,} candidates")
-        for key_name, key_col in tqdm(_KEY_COLS, desc=f"  keys[{country}]", leave=False):
+        for key_name, key_col in tqdm(
+            _KEY_COLS, desc=f"  keys[{country}]", leave=False, mininterval=config.TQDM_MININTERVAL,
+        ):
             hit = _block_one_key(s1c, obc, key_col, key_name, max_block_size, max_pair_product)
             if hit.height:
                 results.append(hit)

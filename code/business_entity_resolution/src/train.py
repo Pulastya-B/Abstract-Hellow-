@@ -212,7 +212,7 @@ def train_model():
           "survive blocking+sampling; it is an approximation of the real recall-ceiling-"
           "aware score from plan.md §7, not the full-pool version yet.")
     best_result = None
-    for t in tqdm(np.arange(0.50, 0.99, 0.01), desc="threshold search"):
+    for t in tqdm(np.arange(0.50, 0.99, 0.01), desc="threshold search", mininterval=config.TQDM_MININTERVAL):
         result = score_at_threshold(val_split, probs, float(t), val_ids, gt_pairs)
         if best_result is None or result["macro_f05"] > best_result["macro_f05"]:
             best_result = result

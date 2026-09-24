@@ -17,6 +17,8 @@ import polars as pl
 from rapidfuzz import fuzz
 from tqdm import tqdm
 
+import config
+
 FEATURE_COLS = [
     "name_ratio",
     "name_token_sort_ratio",
@@ -75,7 +77,9 @@ def add_features(pairs: pl.DataFrame, s1: pl.DataFrame, others: pl.DataFrame) ->
     name_ratio, name_tsort, name_tset = [], [], []
     addr_ratio, addr_tset, exact_name = [], [], []
     rows = zip(s1_names, cand_names, s1_addrs, cand_addrs)
-    for a_name, b_name, a_addr, b_addr in tqdm(rows, total=len(s1_names), desc="computing pairwise features"):
+    for a_name, b_name, a_addr, b_addr in tqdm(
+        rows, total=len(s1_names), desc="computing pairwise features", mininterval=config.TQDM_MININTERVAL,
+    ):
         name_ratio.append(_ratio(a_name, b_name))
         name_tsort.append(_token_sort(a_name, b_name))
         name_tset.append(_token_set(a_name, b_name))
