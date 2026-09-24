@@ -1,0 +1,4 @@
+polars
+rapidfuzz
+lightgbm
+numpy
