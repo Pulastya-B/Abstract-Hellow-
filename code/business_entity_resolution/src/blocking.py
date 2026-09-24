@@ -1,10 +1,16 @@
 """
-v3 blocking: country-partitioned, multi-key union (first token / last token /
-sorted-token signature), vectorized (no Python-level map_elements) and with a
-join-size safety cap on BOTH sides of every key, not just one — the previous
-version could still blow up (and did: OOM-crashed a 12GB Colab runtime) if a
-common token had thousands of hits on the S1 side even when the S2/S3 side
-was capped, since the join cost is the PRODUCT of both sides.
+v4 blocking: country-partitioned, multi-key union (first token / last token /
+sorted-token signature), vectorized (no Python-level map_elements).
+
+Two layered safety caps per key, per country:
+  1. a per-group cap (either side's group size),
+  2. a CUMULATIVE cap on the total join size across ALL groups for that key.
+A per-group-only cap (the previous version) still OOM-crashed on real data:
+capping any single common token's group doesn't stop thousands of moderately
+common tokens from summing to a huge join even though each one individually
+looks "safe". Groups are kept smallest-product-first (the most distinguishing,
+least generic tokens) until the running total hits the budget; the most
+generic/common tokens are the ones dropped when the budget is exhausted.
 
 Each candidate's `num_blocks_agreeing` is tracked as provenance — a candidate
 independently found by several keys is much stronger evidence than one found
@@ -36,7 +42,7 @@ _KEY_COLS = [("first_token", "key_first"), ("last_token", "key_last"), ("sorted_
 
 def _block_one_key(
     s1_part: pl.DataFrame, ob_part: pl.DataFrame, key_col: str, key_name: str,
-    max_block_size: int, max_pair_product: int,
+    max_block_size: int, max_total_pairs: int,
 ) -> pl.DataFrame:
     empty_result = pl.DataFrame(
         schema={
@@ -55,13 +61,29 @@ def _block_one_key(
     ob_counts = obk.group_by(key_col).len().rename({"len": "n_ob"})
     sizes = s1_counts.join(ob_counts, on=key_col, how="inner")
 
-    # Symmetric safety cap: both individual side sizes AND their product must
-    # stay bounded, since join cost scales with the product, not either side alone.
-    safe = sizes.filter(
-        (pl.col("n_s1") <= max_block_size)
-        & (pl.col("n_ob") <= max_block_size)
-        & (pl.col("n_s1").cast(pl.Int64) * pl.col("n_ob").cast(pl.Int64) <= max_pair_product)
-    ).select(key_col)
+    # Per-group cap first (rejects any single pathologically huge group outright),
+    # then a CUMULATIVE cap across all remaining groups: sort smallest-product
+    # (most distinguishing) first, keep adding until the running total would
+    # exceed the budget. This is what actually bounds the join's total output
+    # size — a per-group cap alone lets many medium-size groups sum to a huge
+    # join even though each one individually passes.
+    sizes = sizes.filter((pl.col("n_s1") <= max_block_size) & (pl.col("n_ob") <= max_block_size))
+    sizes = sizes.with_columns(
+        (pl.col("n_s1").cast(pl.Int64) * pl.col("n_ob").cast(pl.Int64)).alias("pair_count")
+    )
+    sizes = sizes.sort("pair_count").with_columns(pl.col("pair_count").cum_sum().alias("cum_pairs"))
+    n_total_keys = sizes.height
+    safe = sizes.filter(pl.col("cum_pairs") <= max_total_pairs)
+    n_safe_keys = safe.height
+    total_pairs = safe["pair_count"].sum() if n_safe_keys else 0
+    tqdm.write(
+        f"    {key_name}: {n_safe_keys}/{n_total_keys} key values kept, "
+        f"~{total_pairs:,} pairs to join"
+    )
+    safe = safe.select(key_col)
+
+    if safe.height == 0:
+        return empty_result
 
     s1k = s1k.join(safe, on=key_col, how="inner")
     obk = obk.join(safe, on=key_col, how="inner")
@@ -75,7 +97,7 @@ def _block_one_key(
 
 def generate_candidates(
     s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
-    top_n: int, max_block_size: int = 5000, max_pair_product: int = 2_000_000,
+    top_n: int, max_block_size: int = 5000, max_total_pairs: int = 3_000_000,
 ) -> pl.DataFrame:
     """
     Returns [source1_entity_id, candidate_id, candidate_source,
@@ -120,7 +142,7 @@ def generate_candidates(
         for key_name, key_col in tqdm(
             _KEY_COLS, desc=f"  keys[{country}]", leave=False, mininterval=config.TQDM_MININTERVAL,
         ):
-            hit = _block_one_key(s1c, obc, key_col, key_name, max_block_size, max_pair_product)
+            hit = _block_one_key(s1c, obc, key_col, key_name, max_block_size, max_total_pairs)
             if hit.height:
                 results.append(hit)
 

@@ -54,7 +54,7 @@ def build_dataset():
 
         candidates_c = generate_candidates(
             s1c, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
-            max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
+            max_block_size=config.MAX_BLOCK_SIZE, max_total_pairs=config.MAX_TOTAL_PAIRS,
         )
         n_candidate_pairs_total += candidates_c.height
 
