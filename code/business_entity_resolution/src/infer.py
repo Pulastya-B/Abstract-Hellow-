@@ -1,69 +1,90 @@
 """
-v2 test inference: multi-key blocking -> features (incl. block-agreement +
-cross-source consistency) -> scored with the trained matcher_a.txt -> both
+v3 test inference: same per-country streaming pattern as train.py's
+build_dataset() — one country at a time (read -> normalize -> block ->
+features -> score), checkpointed to parquet, then reloaded once at the end
+(small: scored pairs + candidate pairs only, not raw text) to write both
 output TSVs in the exact validator format.
 """
 
+import gc
+
 import polars as pl
 import lightgbm as lgb
+from tqdm import tqdm
 
 import config
-from io_utils import read_source, write_results
+import io_utils
+from io_utils import write_results
 from normalize import normalize_df
 from blocking import generate_candidates
 from features import add_features, FEATURE_COLS
 
 
 def run_inference():
-    print("Loading + normalizing test sources...")
-    s1 = normalize_df(read_source(config.TEST_S1), label="test_s1")
-    s2 = normalize_df(read_source(config.TEST_S2), label="test_s2")
-    s3 = normalize_df(read_source(config.TEST_S3), label="test_s3")
-
-    print("Blocking...")
-    candidates = generate_candidates(
-        s1, s2, s3, top_n=config.TOP_N_CANDIDATES,
-        max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
-    )
-
-    others = pl.concat(
-        [
-            s2.with_columns(pl.lit("S2").alias("src")),
-            s3.with_columns(pl.lit("S3").alias("src")),
-        ],
-        how="vertical_relaxed",
-    )
-
-    print("Computing features...")
-    feats = add_features(candidates, s1, others)
-
-    print("Scoring...")
+    print("Loading model + threshold...")
     model = lgb.Booster(model_file=str(config.OUTPUT_DIR / "matcher_a.txt"))
     with open(config.OUTPUT_DIR / "threshold.txt") as f:
         threshold = float(f.read().strip())
 
-    X = feats.select(FEATURE_COLS).to_numpy().astype("float64")
-    probs = model.predict(X)
-    feats = feats.with_columns(pl.Series("prob", probs))
+    countries = sorted(io_utils.list_countries(config.TEST_S1))
+    print(f"Countries: {countries}")
+
+    config.TEST_SCORED_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    config.TEST_CANDIDATE_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    all_s1_ids = []
+
+    for country in tqdm(countries, desc="processing countries"):
+        s1c_raw = io_utils.scan_source_country(config.TEST_S1, country)
+        all_s1_ids.extend(s1c_raw["entity_id"].to_list())
+
+        s1c = normalize_df(s1c_raw, label=f"test_s1[{country}]")
+        s2c = normalize_df(io_utils.scan_source_country(config.TEST_S2, country), label=f"test_s2[{country}]")
+        s3c = normalize_df(io_utils.scan_source_country(config.TEST_S3, country), label=f"test_s3[{country}]")
+
+        candidates_c = generate_candidates(
+            s1c, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
+            max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
+        )
+
+        others_c = pl.concat(
+            [s2c.with_columns(pl.lit("S2").alias("src")), s3c.with_columns(pl.lit("S3").alias("src"))],
+            how="vertical_relaxed",
+        )
+        feats_c = add_features(candidates_c, s1c, others_c)
+
+        X = feats_c.select(FEATURE_COLS).to_numpy().astype("float64")
+        probs = model.predict(X)
+        feats_c = feats_c.with_columns(pl.Series("prob", probs))
+
+        feats_c.select(["source1_entity_id", "candidate_id", "prob"]).write_parquet(
+            config.TEST_SCORED_CHUNK_DIR / f"{country}.parquet"
+        )
+        candidates_c.select(["source1_entity_id", "candidate_id"]).write_parquet(
+            config.TEST_CANDIDATE_CHUNK_DIR / f"{country}.parquet"
+        )
+
+        del s1c_raw, s1c, s2c, s3c, candidates_c, others_c, feats_c, X, probs
+        gc.collect()
+
+    print("Reloading scored + candidate pairs (small: no raw text)...")
+    all_scored = pl.scan_parquet(str(config.TEST_SCORED_CHUNK_DIR / "*.parquet")).collect()
+    all_candidates = pl.scan_parquet(str(config.TEST_CANDIDATE_CHUNK_DIR / "*.parquet")).collect()
+    all_s1_series = pl.Series("entity_id", all_s1_ids)
 
     print("Writing candidate_pairs.tsv...")
     write_results(
-        s1["entity_id"],
-        candidates.select(["source1_entity_id", "candidate_id"]),
-        config.OUTPUT_DIR / "candidate_pairs.tsv",
-        "candidate_entity_ids",
+        all_s1_series, all_candidates,
+        config.OUTPUT_DIR / "candidate_pairs.tsv", "candidate_entity_ids",
     )
 
     print(f"Writing matching_results.tsv (threshold={threshold:.2f})...")
-    matches = feats.filter(pl.col("prob") >= threshold).select(["source1_entity_id", "candidate_id"])
+    matches = all_scored.filter(pl.col("prob") >= threshold).select(["source1_entity_id", "candidate_id"])
     write_results(
-        s1["entity_id"],
-        matches,
-        config.OUTPUT_DIR / "matching_results.tsv",
-        "matched_entity_ids",
+        all_s1_series, matches,
+        config.OUTPUT_DIR / "matching_results.tsv", "matched_entity_ids",
     )
 
-    n_test_entities = s1.height
+    n_test_entities = len(all_s1_ids)
     matched_entities = matches["source1_entity_id"].n_unique()
     n_matched_pairs = matches.height
     n_predicted_singletons = n_test_entities - matched_entities

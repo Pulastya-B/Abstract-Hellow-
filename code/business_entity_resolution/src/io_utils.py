@@ -6,6 +6,30 @@ def read_source(path) -> pl.DataFrame:
     return pl.read_csv(path, separator="\t")
 
 
+def list_countries(path) -> list:
+    """Cheap: scan just the country column instead of loading the whole file."""
+    return (
+        pl.scan_csv(path, separator="\t")
+        .select("country")
+        .unique()
+        .collect()["country"]
+        .to_list()
+    )
+
+
+def scan_source_country(path, country: str) -> pl.DataFrame:
+    """
+    Read only one country's rows of a source1/2/3 TSV, via lazy scan + filter
+    pushdown — keeps peak memory bounded to one country's slice instead of
+    materializing the whole (multi-million-row) table first.
+    """
+    return (
+        pl.scan_csv(path, separator="\t", low_memory=True)
+        .filter(pl.col("country") == country)
+        .collect()
+    )
+
+
 def read_ground_truth(path) -> pl.DataFrame:
     """Read train_ground_truth.tsv: source1_entity_id, matched_entity_ids (comma list)."""
     return pl.read_csv(path, separator="\t")

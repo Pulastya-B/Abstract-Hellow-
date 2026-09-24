@@ -1,10 +1,21 @@
 """
-v2 training: single LightGBM matcher (plan.md §6a, without the K-fold OOF/
+v3 training: single LightGBM matcher (plan.md §6a, without the K-fold OOF/
 ensemble machinery from the later milestones — that's layered in once this
-baseline is proven), now with hard-negative-prioritized sampling. Builds
-labeled rows from the pruned candidate pool, trains, and grid-searches a
-threshold directly against macro F_0.5.
+baseline is proven), with hard-negative-prioritized sampling.
+
+Processes ONE COUNTRY AT A TIME end to end (read -> normalize -> block ->
+features -> label), checkpointing each country's engineered features to a
+parquet chunk and freeing memory before moving to the next. This replaced an
+earlier version that read+normalized the full unfiltered source2/3 tables
+(5M+ rows each) before any country split happened — that's what was actually
+OOM-crashing a 12GB Colab runtime, not just the blocking join (which was
+already fixed to be country-partitioned, but too late to help: the crash was
+upstream of it). The final sampling/training step reloads only the much
+smaller engineered-feature chunks, which is memory-cheap even for the full
+dataset.
 """
+
+import gc
 
 import numpy as np
 import polars as pl
@@ -12,52 +23,66 @@ import lightgbm as lgb
 from tqdm import tqdm
 
 import config
-from io_utils import read_source, read_ground_truth, explode_ground_truth
+import io_utils
+from io_utils import read_ground_truth, explode_ground_truth
 from normalize import normalize_df
 from blocking import generate_candidates
 from features import add_features, FEATURE_COLS
 
 
 def build_dataset():
-    print("Loading + normalizing train sources...")
-    s1 = normalize_df(read_source(config.TRAIN_S1), label="train_s1")
-    s2 = normalize_df(read_source(config.TRAIN_S2), label="train_s2")
-    s3 = normalize_df(read_source(config.TRAIN_S3), label="train_s3")
+    print("Loading ground truth...")
     gt = read_ground_truth(config.TRAIN_GT)
     pos_pairs = explode_ground_truth(gt)
-    print(f"  {len(pos_pairs)} ground-truth positive pairs")
+    n_gt_pairs = len(pos_pairs)
+    gt_pairs = set(zip(pos_pairs["source1_entity_id"].to_list(), pos_pairs["candidate_id"].to_list()))
+    print(f"  {n_gt_pairs} ground-truth positive pairs")
+    del gt, pos_pairs
+    gc.collect()
 
-    print("Blocking...")
-    candidates = generate_candidates(
-        s1, s2, s3, top_n=config.TOP_N_CANDIDATES,
-        max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
-    )
-    print(f"  {len(candidates)} candidate pairs generated")
+    countries = sorted(io_utils.list_countries(config.TRAIN_S1))
+    print(f"Countries: {countries}")
 
-    others = pl.concat(
-        [
-            s2.with_columns(pl.lit("S2").alias("src")),
-            s3.with_columns(pl.lit("S3").alias("src")),
-        ],
-        how="vertical_relaxed",
-    )
+    config.TRAIN_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    n_candidate_pairs_total = 0
+    n_recalled_total = 0
 
-    print("Computing features...")
-    feats = add_features(candidates, s1, others)
+    for country in tqdm(countries, desc="processing countries"):
+        s1c = normalize_df(io_utils.scan_source_country(config.TRAIN_S1, country), label=f"train_s1[{country}]")
+        s2c = normalize_df(io_utils.scan_source_country(config.TRAIN_S2, country), label=f"train_s2[{country}]")
+        s3c = normalize_df(io_utils.scan_source_country(config.TRAIN_S3, country), label=f"train_s3[{country}]")
 
-    pos_set = set(zip(pos_pairs["source1_entity_id"].to_list(), pos_pairs["candidate_id"].to_list()))
-    labels = [
-        1 if (s1id, cid) in pos_set else 0
-        for s1id, cid in zip(feats["source1_entity_id"].to_list(), feats["candidate_id"].to_list())
-    ]
-    feats = feats.with_columns(pl.Series("label", labels))
+        candidates_c = generate_candidates(
+            s1c, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
+            max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
+        )
+        n_candidate_pairs_total += candidates_c.height
 
-    n_pos = int(sum(labels))
-    n_recalled = n_pos
-    recall_ceiling_pct = 100 * n_recalled / max(len(pos_pairs), 1)
-    print(f"  recall check: {n_recalled}/{len(pos_pairs)} true pairs survived blocking "
+        others_c = pl.concat(
+            [s2c.with_columns(pl.lit("S2").alias("src")), s3c.with_columns(pl.lit("S3").alias("src"))],
+            how="vertical_relaxed",
+        )
+        feats_c = add_features(candidates_c, s1c, others_c)
+
+        labels = [
+            1 if (s1id, cid) in gt_pairs else 0
+            for s1id, cid in zip(feats_c["source1_entity_id"].to_list(), feats_c["candidate_id"].to_list())
+        ]
+        feats_c = feats_c.with_columns(pl.Series("label", labels))
+        n_recalled_total += sum(labels)
+
+        feats_c.write_parquet(config.TRAIN_CHUNK_DIR / f"{country}.parquet")
+
+        del s1c, s2c, s3c, candidates_c, others_c, feats_c, labels
+        gc.collect()
+
+    recall_ceiling_pct = 100 * n_recalled_total / max(n_gt_pairs, 1)
+    print(f"  recall check: {n_recalled_total}/{n_gt_pairs} true pairs survived blocking "
           f"({recall_ceiling_pct:.1f}%) — should be checked against "
           f"the >=97% target in plan.md §3 before trusting downstream numbers")
+
+    print("Reloading engineered features for sampling (small: numeric columns only)...")
+    feats = pl.scan_parquet(str(config.TRAIN_CHUNK_DIR / "*.parquet")).collect()
 
     pos = feats.filter(pl.col("label") == 1)
     neg = feats.filter(pl.col("label") == 0)
@@ -80,14 +105,14 @@ def build_dataset():
           f"({len(hard_neg)} hard / {len(easy_neg)} easy)")
 
     dataset_stats = {
-        "n_ground_truth_pairs": len(pos_pairs),
-        "n_candidate_pairs": len(candidates),
-        "n_positives_recalled": n_recalled,
+        "n_ground_truth_pairs": n_gt_pairs,
+        "n_candidate_pairs": n_candidate_pairs_total,
+        "n_positives_recalled": n_recalled_total,
         "recall_ceiling_pct": recall_ceiling_pct,
         "n_train_positive_rows": len(pos),
         "n_train_negative_rows": len(neg),
     }
-    return train_rows, pos_pairs, dataset_stats
+    return train_rows, gt_pairs, dataset_stats
 
 
 def entity_split(rows: pl.DataFrame):
@@ -161,7 +186,7 @@ def macro_f05(val_rows: pl.DataFrame, probs: np.ndarray, threshold: float, val_i
 
 
 def train_model():
-    train_rows, pos_pairs, dataset_stats = build_dataset()
+    train_rows, gt_pairs, dataset_stats = build_dataset()
     train_split, val_split, val_ids = entity_split(train_rows)
     print(f"Train/val entity split: {train_split['source1_entity_id'].n_unique()} / "
           f"{len(val_ids)} entities")
@@ -181,8 +206,6 @@ def train_model():
     model.fit(X_train, y_train)
 
     probs = model.predict_proba(X_val)[:, 1]
-
-    gt_pairs = set(zip(pos_pairs["source1_entity_id"].to_list(), pos_pairs["candidate_id"].to_list()))
 
     print("Searching threshold for macro F_0.5...")
     print("NOTE: this validation set only covers S1 entities that had >=1 candidate "

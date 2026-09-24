@@ -11,6 +11,13 @@ OUTPUT_DIR = REPO_DIR / "output"
 TRAIN_DIR = DATASET_DIR / "train"
 TEST_DIR = DATASET_DIR / "test"
 
+# Per-country checkpoint chunks (parquet) so the pipeline never has to hold
+# every country's data in memory at once — written incrementally, reloaded
+# once at the end for the (much smaller) sampling/training/output step.
+TRAIN_CHUNK_DIR = OUTPUT_DIR / "_chunks" / "train"
+TEST_SCORED_CHUNK_DIR = OUTPUT_DIR / "_chunks" / "test_scored"
+TEST_CANDIDATE_CHUNK_DIR = OUTPUT_DIR / "_chunks" / "test_candidates"
+
 TRAIN_S1 = TRAIN_DIR / "train_source1.tsv"
 TRAIN_S2 = TRAIN_DIR / "train_source2.tsv"
 TRAIN_S3 = TRAIN_DIR / "train_source3.tsv"
