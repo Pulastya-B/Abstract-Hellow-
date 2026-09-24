@@ -16,12 +16,15 @@ from features import add_features, FEATURE_COLS
 
 def run_inference():
     print("Loading + normalizing test sources...")
-    s1 = normalize_df(read_source(config.TEST_S1))
-    s2 = normalize_df(read_source(config.TEST_S2))
-    s3 = normalize_df(read_source(config.TEST_S3))
+    s1 = normalize_df(read_source(config.TEST_S1), label="test_s1")
+    s2 = normalize_df(read_source(config.TEST_S2), label="test_s2")
+    s3 = normalize_df(read_source(config.TEST_S3), label="test_s3")
 
     print("Blocking...")
-    candidates = generate_candidates(s1, s2, s3, top_n=config.TOP_N_CANDIDATES)
+    candidates = generate_candidates(
+        s1, s2, s3, top_n=config.TOP_N_CANDIDATES,
+        max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
+    )
 
     others = pl.concat(
         [

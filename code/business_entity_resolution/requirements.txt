@@ -2,3 +2,4 @@ polars
 rapidfuzz
 lightgbm
 numpy
+tqdm

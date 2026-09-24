@@ -15,6 +15,7 @@ No embedding cosine similarity yet (plan.md §5) — later addition.
 
 import polars as pl
 from rapidfuzz import fuzz
+from tqdm import tqdm
 
 FEATURE_COLS = [
     "name_ratio",
@@ -71,12 +72,16 @@ def add_features(pairs: pl.DataFrame, s1: pl.DataFrame, others: pl.DataFrame) ->
     s1_addrs = df["s1_addr"].to_list()
     cand_addrs = df["cand_addr"].to_list()
 
-    name_ratio = [_ratio(a, b) for a, b in zip(s1_names, cand_names)]
-    name_tsort = [_token_sort(a, b) for a, b in zip(s1_names, cand_names)]
-    name_tset = [_token_set(a, b) for a, b in zip(s1_names, cand_names)]
-    addr_ratio = [_ratio(a, b) for a, b in zip(s1_addrs, cand_addrs)]
-    addr_tset = [_token_set(a, b) for a, b in zip(s1_addrs, cand_addrs)]
-    exact_name = [1.0 if a == b and a != "" else 0.0 for a, b in zip(s1_names, cand_names)]
+    name_ratio, name_tsort, name_tset = [], [], []
+    addr_ratio, addr_tset, exact_name = [], [], []
+    rows = zip(s1_names, cand_names, s1_addrs, cand_addrs)
+    for a_name, b_name, a_addr, b_addr in tqdm(rows, total=len(s1_names), desc="computing pairwise features"):
+        name_ratio.append(_ratio(a_name, b_name))
+        name_tsort.append(_token_sort(a_name, b_name))
+        name_tset.append(_token_set(a_name, b_name))
+        addr_ratio.append(_ratio(a_addr, b_addr))
+        addr_tset.append(_token_set(a_addr, b_addr))
+        exact_name.append(1.0 if a_name == b_name and a_name != "" else 0.0)
 
     df = df.with_columns([
         pl.Series("name_ratio", name_ratio),

@@ -1,10 +1,13 @@
 from pathlib import Path
 
-# ── EDIT THESE TWO LINES to match wherever you mounted the data on Kaggle/Colab ──
-BASE_DIR = Path("/content/student_resource/student_resource")
-OUTPUT_DIR = BASE_DIR / "output"
+# ── EDIT THESE TWO LINES for your environment ──
+# Where the cloned repo lives (this determines where outputs get written)
+REPO_DIR = Path("/content/<your-repo-name>")
+# Where the dataset lives — NOT in the git repo (dataset/ is gitignored), so
+# this must point at wherever you separately mounted/downloaded it (Drive, etc.)
+DATASET_DIR = Path("/content/drive/MyDrive/student_resource/dataset")
 
-DATASET_DIR = BASE_DIR / "dataset"
+OUTPUT_DIR = REPO_DIR / "output"
 TRAIN_DIR = DATASET_DIR / "train"
 TEST_DIR = DATASET_DIR / "test"
 
@@ -22,4 +25,5 @@ NEG_PER_POS = 4                 # negative:positive sampling ratio for training
 HARD_NEGATIVE_FRACTION = 0.7    # share of sampled negatives that are high-name_ratio non-matches
 RANDOM_SEED = 42
 VAL_FRACTION = 0.15             # fraction of S1 entities held out for threshold search
-MAX_BLOCK_SIZE = 20000          # safety cap: skip a blocking key if either side's group exceeds this
+MAX_BLOCK_SIZE = 5000           # safety cap: skip a blocking key if EITHER side's group exceeds this
+MAX_PAIR_PRODUCT = 2_000_000    # safety cap: skip a blocking key if the join size (n_s1 * n_candidates) exceeds this

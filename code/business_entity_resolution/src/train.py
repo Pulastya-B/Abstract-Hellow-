@@ -9,6 +9,7 @@ threshold directly against macro F_0.5.
 import numpy as np
 import polars as pl
 import lightgbm as lgb
+from tqdm import tqdm
 
 import config
 from io_utils import read_source, read_ground_truth, explode_ground_truth
@@ -19,15 +20,18 @@ from features import add_features, FEATURE_COLS
 
 def build_dataset():
     print("Loading + normalizing train sources...")
-    s1 = normalize_df(read_source(config.TRAIN_S1))
-    s2 = normalize_df(read_source(config.TRAIN_S2))
-    s3 = normalize_df(read_source(config.TRAIN_S3))
+    s1 = normalize_df(read_source(config.TRAIN_S1), label="train_s1")
+    s2 = normalize_df(read_source(config.TRAIN_S2), label="train_s2")
+    s3 = normalize_df(read_source(config.TRAIN_S3), label="train_s3")
     gt = read_ground_truth(config.TRAIN_GT)
     pos_pairs = explode_ground_truth(gt)
     print(f"  {len(pos_pairs)} ground-truth positive pairs")
 
     print("Blocking...")
-    candidates = generate_candidates(s1, s2, s3, top_n=config.TOP_N_CANDIDATES)
+    candidates = generate_candidates(
+        s1, s2, s3, top_n=config.TOP_N_CANDIDATES,
+        max_block_size=config.MAX_BLOCK_SIZE, max_pair_product=config.MAX_PAIR_PRODUCT,
+    )
     print(f"  {len(candidates)} candidate pairs generated")
 
     others = pl.concat(
@@ -185,7 +189,7 @@ def train_model():
           "survive blocking+sampling; it is an approximation of the real recall-ceiling-"
           "aware score from plan.md §7, not the full-pool version yet.")
     best_result = None
-    for t in np.arange(0.50, 0.99, 0.01):
+    for t in tqdm(np.arange(0.50, 0.99, 0.01), desc="threshold search"):
         result = score_at_threshold(val_split, probs, float(t), val_ids, gt_pairs)
         if best_result is None or result["macro_f05"] > best_result["macro_f05"]:
             best_result = result

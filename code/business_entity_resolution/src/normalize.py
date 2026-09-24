@@ -11,6 +11,7 @@ import re
 import unicodedata
 
 import polars as pl
+from tqdm import tqdm
 
 LEGAL_SUFFIXES = [
     "private limited", "pvt ltd", "pvt. ltd.", "pvt ltd.", "private ltd",
@@ -39,13 +40,14 @@ def _strip_suffixes(s: str) -> str:
     return _WS_RE.sub(" ", s).strip()
 
 
-def normalize_df(df: pl.DataFrame) -> pl.DataFrame:
+def normalize_df(df: pl.DataFrame, label: str = "") -> pl.DataFrame:
     names = df["business_name"].to_list()
     addrs = df["business_address"].to_list()
+    tag = f"[{label}] " if label else ""
 
-    norm_names = [_normalize_str(n) for n in names]
-    core_names = [_strip_suffixes(n) for n in norm_names]
-    norm_addrs = [_normalize_str(a) for a in addrs]
+    norm_names = [_normalize_str(n) for n in tqdm(names, desc=f"{tag}normalize names")]
+    core_names = [_strip_suffixes(n) for n in tqdm(norm_names, desc=f"{tag}strip suffixes")]
+    norm_addrs = [_normalize_str(a) for a in tqdm(addrs, desc=f"{tag}normalize addresses")]
 
     return df.with_columns([
         pl.Series("normalized_name", norm_names),
