@@ -1,5 +1,9 @@
 polars
 rapidfuzz
 lightgbm
+scikit-learn
+scipy
 numpy
 tqdm
+sentence-transformers
+faiss-cpu

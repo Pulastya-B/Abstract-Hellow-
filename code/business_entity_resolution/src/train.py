@@ -1,18 +1,18 @@
 """
-v3 training: single LightGBM matcher (plan.md §6a, without the K-fold OOF/
-ensemble machinery from the later milestones — that's layered in once this
-baseline is proven), with hard-negative-prioritized sampling.
+v4 training: single LightGBM matcher, now scored against the corrected,
+competition-faithful validation framework (validate_f05.py) instead of the
+old survivor-only approximation.
+
+Key fix vs. v3: the train/val ENTITY split is drawn from the FULL S1
+population in the ground truth file BEFORE blocking or negative sampling run
+— not from whatever happened to survive into the sampled feature rows. Every
+val S1 entity is scored, including ones blocking gave zero candidates to
+(correctly counted as a recall miss, not silently dropped from the average).
 
 Processes ONE COUNTRY AT A TIME end to end (read -> normalize -> block ->
 features -> label), checkpointing each country's engineered features to a
-parquet chunk and freeing memory before moving to the next. This replaced an
-earlier version that read+normalized the full unfiltered source2/3 tables
-(5M+ rows each) before any country split happened — that's what was actually
-OOM-crashing a 12GB Colab runtime, not just the blocking join (which was
-already fixed to be country-partitioned, but too late to help: the crash was
-upstream of it). The final sampling/training step reloads only the much
-smaller engineered-feature chunks, which is memory-cheap even for the full
-dataset.
+parquet chunk and freeing memory before moving to the next — unchanged from
+v3, this part was never the source of the validation bias.
 """
 
 import gc
@@ -28,32 +28,45 @@ from io_utils import read_ground_truth, explode_ground_truth
 from normalize import normalize_df
 from blocking import generate_candidates
 from features import add_features, FEATURE_COLS
+import validate_f05
 
 
-def build_dataset():
-    print("Loading ground truth...")
-    gt = read_ground_truth(config.TRAIN_GT)
-    pos_pairs = explode_ground_truth(gt)
-    n_gt_pairs = len(pos_pairs)
-    gt_pairs = set(zip(pos_pairs["source1_entity_id"].to_list(), pos_pairs["candidate_id"].to_list()))
-    print(f"  {n_gt_pairs} ground-truth positive pairs")
-    del gt, pos_pairs
-    gc.collect()
+def build_dataset(train_entity_ids: set, val_entity_ids: set, gt_pairs: set):
+    """
+    Runs blocking + features for every country, over the FULL S1 population
+    (both train_entity_ids and val_entity_ids) — val entities need candidates
+    generated too, exactly as they would at real inference time, so blocking
+    recall can be measured on them independently of the matcher.
 
+    Returns:
+      train_rows: sampled (positive + hard/easy negative) feature rows for
+                  TRAIN entities only — this is what the model trains on.
+      val_candidates: ALL candidate rows for VAL entities (no negative
+                  sampling — every val entity's full candidate set is scored).
+      dataset_stats, candidate_by_s1 (val-only, for blocking-recall scoring)
+    """
     countries = sorted(io_utils.list_countries(config.TRAIN_S1))
     print(f"Countries: {countries}")
 
     config.TRAIN_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
     n_candidate_pairs_total = 0
     n_recalled_total = 0
+    n_gt_pairs = len(gt_pairs)
+
+    val_chunk_dir = config.TRAIN_CHUNK_DIR.parent / "val_candidates"
+    val_chunk_dir.mkdir(parents=True, exist_ok=True)
 
     for country in tqdm(countries, desc="processing countries"):
-        s1c = normalize_df(io_utils.scan_source_country(config.TRAIN_S1, country), label=f"train_s1[{country}]")
+        s1c_full = normalize_df(io_utils.scan_source_country(config.TRAIN_S1, country), label=f"train_s1[{country}]")
         s2c = normalize_df(io_utils.scan_source_country(config.TRAIN_S2, country), label=f"train_s2[{country}]")
         s3c = normalize_df(io_utils.scan_source_country(config.TRAIN_S3, country), label=f"train_s3[{country}]")
 
+        # Blocking runs over EVERY S1 entity in this country (train + val) —
+        # val entities must go through the exact same candidate-generation
+        # path they would at real inference time, so blocking recall on them
+        # is measured honestly rather than assumed.
         candidates_c = generate_candidates(
-            s1c, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
+            s1c_full, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
             max_block_size=config.MAX_BLOCK_SIZE, max_total_pairs=config.MAX_TOTAL_PAIRS,
         )
         n_candidate_pairs_total += candidates_c.height
@@ -62,7 +75,7 @@ def build_dataset():
             [s2c.with_columns(pl.lit("S2").alias("src")), s3c.with_columns(pl.lit("S3").alias("src"))],
             how="vertical_relaxed",
         )
-        feats_c = add_features(candidates_c, s1c, others_c)
+        feats_c = add_features(candidates_c, s1c_full, others_c)
 
         labels = [
             1 if (s1id, cid) in gt_pairs else 0
@@ -71,26 +84,27 @@ def build_dataset():
         feats_c = feats_c.with_columns(pl.Series("label", labels))
         n_recalled_total += sum(labels)
 
-        feats_c.write_parquet(config.TRAIN_CHUNK_DIR / f"{country}.parquet")
+        is_val = pl.col("source1_entity_id").is_in(list(val_entity_ids))
+        val_feats_c = feats_c.filter(is_val)
+        train_feats_c = feats_c.filter(~is_val)
 
-        del s1c, s2c, s3c, candidates_c, others_c, feats_c, labels
+        train_feats_c.write_parquet(config.TRAIN_CHUNK_DIR / f"{country}.parquet")
+        val_feats_c.write_parquet(val_chunk_dir / f"{country}.parquet")
+
+        del s1c_full, s2c, s3c, candidates_c, others_c, feats_c, labels, val_feats_c, train_feats_c
         gc.collect()
 
     recall_ceiling_pct = 100 * n_recalled_total / max(n_gt_pairs, 1)
-    print(f"  recall check: {n_recalled_total}/{n_gt_pairs} true pairs survived blocking "
-          f"({recall_ceiling_pct:.1f}%) — should be checked against "
-          f"the >=97% target in plan.md §3 before trusting downstream numbers")
+    print(f"  recall check (train+val entities combined): {n_recalled_total}/{n_gt_pairs} true pairs "
+          f"survived blocking ({recall_ceiling_pct:.1f}%) — target >={config.RECALL_TARGET_PCT}%")
 
-    print("Reloading engineered features for sampling (small: numeric columns only)...")
-    feats = pl.scan_parquet(str(config.TRAIN_CHUNK_DIR / "*.parquet")).collect()
+    print("Reloading TRAIN engineered features for sampling...")
+    train_feats = pl.scan_parquet(str(config.TRAIN_CHUNK_DIR / "*.parquet")).collect()
 
-    pos = feats.filter(pl.col("label") == 1)
-    neg = feats.filter(pl.col("label") == 0)
+    pos = train_feats.filter(pl.col("label") == 1)
+    neg = train_feats.filter(pl.col("label") == 0)
     n_neg = min(len(neg), len(pos) * config.NEG_PER_POS)
 
-    # Hard-negative-prioritized sampling: mostly high-name_ratio non-matches
-    # (what F_0.5 punishes hardest), plus a smaller random slice for diversity —
-    # not a uniform random sample, per plan.md §6a.
     n_hard = int(n_neg * config.HARD_NEGATIVE_FRACTION)
     n_easy = n_neg - n_hard
     neg_sorted = neg.sort("name_ratio", descending=True)
@@ -104,6 +118,9 @@ def build_dataset():
     print(f"  training rows: {len(pos)} positive, {len(neg)} negative "
           f"({len(hard_neg)} hard / {len(easy_neg)} easy)")
 
+    print("Reloading VAL candidates (full pool, no sampling)...")
+    val_candidates = pl.scan_parquet(str(val_chunk_dir / "*.parquet")).collect()
+
     dataset_stats = {
         "n_ground_truth_pairs": n_gt_pairs,
         "n_candidate_pairs": n_candidate_pairs_total,
@@ -112,88 +129,42 @@ def build_dataset():
         "n_train_positive_rows": len(pos),
         "n_train_negative_rows": len(neg),
     }
-    return train_rows, gt_pairs, dataset_stats
-
-
-def entity_split(rows: pl.DataFrame):
-    s1_ids = rows["source1_entity_id"].unique().to_list()
-    rng = np.random.default_rng(config.RANDOM_SEED)
-    rng.shuffle(s1_ids)
-    n_val = int(len(s1_ids) * config.VAL_FRACTION)
-    val_ids = set(s1_ids[:n_val])
-    val_mask = pl.col("source1_entity_id").is_in(list(val_ids))
-    return rows.filter(~val_mask), rows.filter(val_mask), val_ids
-
-
-def f_beta(precision, recall, beta=0.5):
-    if precision == 0 and recall == 0:
-        return 0.0
-    b2 = beta ** 2
-    return (1 + b2) * precision * recall / (b2 * precision + recall + 1e-12)
-
-
-def score_at_threshold(val_rows: pl.DataFrame, probs: np.ndarray, threshold: float, val_ids: set, gt_pairs: set) -> dict:
-    """Full per-entity breakdown at a given threshold: macro F_0.5, mean precision/recall,
-    and singleton accuracy (fraction of true-empty entities correctly predicted empty)."""
-    val = val_rows.with_columns(pl.Series("prob", probs))
-    preds = val.filter(pl.col("prob") >= threshold)
-
-    pred_by_s1 = {}
-    for s1id, cid in zip(preds["source1_entity_id"].to_list(), preds["candidate_id"].to_list()):
-        pred_by_s1.setdefault(s1id, set()).add(cid)
-
-    true_by_s1 = {}
-    for s1id, cid in gt_pairs:
-        if s1id in val_ids:
-            true_by_s1.setdefault(s1id, set()).add(cid)
-
-    f_scores, precisions, recalls = [], [], []
-    n_true_singletons = n_true_singletons_correct = 0
-    for s1id in val_ids:
-        pred = pred_by_s1.get(s1id, set())
-        true = true_by_s1.get(s1id, set())
-        if not true:
-            n_true_singletons += 1
-            if not pred:
-                f_scores.append(1.0)
-                precisions.append(1.0)
-                recalls.append(1.0)
-                n_true_singletons_correct += 1
-            else:
-                f_scores.append(0.0)
-                precisions.append(0.0)
-                recalls.append(0.0)
-        else:
-            tp = len(pred & true)
-            precision = tp / len(pred) if pred else 0.0
-            recall = tp / len(true) if true else 0.0
-            f_scores.append(f_beta(precision, recall))
-            precisions.append(precision)
-            recalls.append(recall)
-
-    return {
-        "threshold": threshold,
-        "macro_f05": float(np.mean(f_scores)) if f_scores else 0.0,
-        "mean_precision": float(np.mean(precisions)) if precisions else 0.0,
-        "mean_recall": float(np.mean(recalls)) if recalls else 0.0,
-        "n_true_singletons": n_true_singletons,
-        "singleton_accuracy": n_true_singletons_correct / n_true_singletons if n_true_singletons else 0.0,
-    }
-
-
-def macro_f05(val_rows: pl.DataFrame, probs: np.ndarray, threshold: float, val_ids: set, gt_pairs: set) -> float:
-    return score_at_threshold(val_rows, probs, threshold, val_ids, gt_pairs)["macro_f05"]
+    return train_rows, val_candidates, dataset_stats
 
 
 def train_model():
-    train_rows, gt_pairs, dataset_stats = build_dataset()
-    train_split, val_split, val_ids = entity_split(train_rows)
-    print(f"Train/val entity split: {train_split['source1_entity_id'].n_unique()} / "
-          f"{len(val_ids)} entities")
+    print("Loading full ground-truth entity index...")
+    all_s1_ids, true_by_s1 = validate_f05.load_full_gt_index(config.TRAIN_GT)
+    gt = read_ground_truth(config.TRAIN_GT)
+    pos_pairs = explode_ground_truth(gt)
+    gt_pairs = set(zip(pos_pairs["source1_entity_id"].to_list(), pos_pairs["candidate_id"].to_list()))
+    del gt, pos_pairs
+    gc.collect()
 
-    X_train = train_split.select(FEATURE_COLS).to_numpy().astype("float64")
-    y_train = train_split["label"].to_numpy()
-    X_val = val_split.select(FEATURE_COLS).to_numpy().astype("float64")
+    # Entity split drawn from the FULL S1 population, before any blocking or
+    # sampling — this is the fix: val_ids no longer depends on what happens
+    # to survive into the sampled feature rows.
+    train_entity_ids, val_entity_ids = validate_f05.entity_train_val_split(
+        all_s1_ids, config.VAL_FRACTION, config.RANDOM_SEED,
+    )
+    print(f"Full entity split: {len(train_entity_ids):,} train / {len(val_entity_ids):,} val "
+          f"(out of {len(all_s1_ids):,} total S1 entities)")
+
+    train_rows, val_candidates, dataset_stats = build_dataset(train_entity_ids, val_entity_ids, gt_pairs)
+
+    s1_full = io_utils.read_source(config.TRAIN_S1)
+    s1_country = dict(zip(s1_full["entity_id"].to_list(), s1_full["country"].to_list()))
+    del s1_full
+    gc.collect()
+
+    candidate_by_s1 = {}
+    for s1id, cid in zip(val_candidates["source1_entity_id"].to_list(), val_candidates["candidate_id"].to_list()):
+        candidate_by_s1.setdefault(s1id, set()).add(cid)
+
+    blocking_recall = validate_f05.score_blocking_recall(val_entity_ids, true_by_s1, candidate_by_s1)
+
+    X_train = train_rows.select(FEATURE_COLS).to_numpy().astype("float64")
+    y_train = train_rows["label"].to_numpy()
 
     print("Training LightGBM...")
     model = lgb.LGBMClassifier(
@@ -205,43 +176,34 @@ def train_model():
     )
     model.fit(X_train, y_train)
 
-    probs = model.predict_proba(X_val)[:, 1]
+    print(f"Scoring VAL candidates ({val_candidates.height:,} rows, "
+          f"{val_candidates['source1_entity_id'].n_unique():,} entities with >=1 candidate)...")
+    X_val = val_candidates.select(FEATURE_COLS).to_numpy().astype("float64")
+    probs = model.predict_proba(X_val)[:, 1] if X_val.shape[0] else np.array([])
+    val_candidates = val_candidates.with_columns(pl.Series("prob", probs)) if X_val.shape[0] else val_candidates
 
-    print("Searching threshold for macro F_0.5...")
-    print("NOTE: this validation set only covers S1 entities that had >=1 candidate "
-          "survive blocking+sampling; it is an approximation of the real recall-ceiling-"
-          "aware score from plan.md §7, not the full-pool version yet.")
-    best_result = None
+    print("Searching threshold for macro F_0.5 over the FULL val population "
+          "(including val entities blocking gave zero candidates to)...")
+    best_threshold, best_score = None, None
     for t in tqdm(np.arange(0.50, 0.99, 0.01), desc="threshold search", mininterval=config.TQDM_MININTERVAL):
-        result = score_at_threshold(val_split, probs, float(t), val_ids, gt_pairs)
-        if best_result is None or result["macro_f05"] > best_result["macro_f05"]:
-            best_result = result
+        preds = val_candidates.filter(pl.col("prob") >= float(t)) if val_candidates.height else val_candidates
+        predicted_by_s1 = {}
+        for s1id, cid in zip(preds["source1_entity_id"].to_list(), preds["candidate_id"].to_list()):
+            predicted_by_s1.setdefault(s1id, set()).add(cid)
+        result = validate_f05.score_entities(val_entity_ids, true_by_s1, predicted_by_s1, s1_country)
+        if best_score is None or result["macro_f05"] > best_score["macro_f05"]:
+            best_threshold, best_score = float(t), result
 
-    print(f"Best threshold: {best_result['threshold']:.2f}")
+    print(f"Best threshold: {best_threshold:.2f}")
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     model.booster_.save_model(str(config.OUTPUT_DIR / "matcher_a.txt"))
     with open(config.OUTPUT_DIR / "threshold.txt", "w") as f:
-        f.write(str(best_result["threshold"]))
+        f.write(str(best_threshold))
 
-    metrics = {**dataset_stats, **best_result, "n_train_entities": train_split["source1_entity_id"].n_unique(),
-               "n_val_entities": len(val_ids)}
+    validate_f05.print_report(blocking_recall, best_score, best_threshold, dataset_stats)
 
-    print("\n===== TRAINING SCORES =====")
-    print(f"  Ground-truth positive pairs:      {metrics['n_ground_truth_pairs']:,}")
-    print(f"  Candidate pairs after blocking:   {metrics['n_candidate_pairs']:,}")
-    print(f"  Recall ceiling (blocking):        {metrics['recall_ceiling_pct']:.1f}%  (target >=97%)")
-    print(f"  Train/val entities:               {metrics['n_train_entities']:,} / {metrics['n_val_entities']:,}")
-    print(f"  Best threshold:                   {metrics['threshold']:.2f}")
-    print(f"  Val macro F_0.5 (approx):         {metrics['macro_f05']:.4f}")
-    print(f"  Val mean precision:               {metrics['mean_precision']:.4f}")
-    print(f"  Val mean recall:                  {metrics['mean_recall']:.4f}")
-    print(f"  Val singleton accuracy:           {metrics['singleton_accuracy']:.4f}  "
-          f"({metrics['n_true_singletons']:,} true singletons in val)")
-    print(f"  Saved model + threshold to:       {config.OUTPUT_DIR}")
-    print("============================\n")
-
-    return model, metrics
+    return model, {"blocking_recall": blocking_recall, "matcher_scores": best_score, "threshold": best_threshold}
 
 
 if __name__ == "__main__":
