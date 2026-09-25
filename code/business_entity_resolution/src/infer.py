@@ -6,6 +6,8 @@ features -> score), checkpointed to parquet, then reloaded once at the end
 output TSVs in the exact validator format.
 """
 
+import _thread_limits  # noqa: F401 — must be the first import; see that module's docstring
+
 import gc
 
 import polars as pl

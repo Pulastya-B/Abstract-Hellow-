@@ -15,6 +15,8 @@ Usage:
     python blocking_report.py [--no-embedding] [--countries US,India]
 """
 
+import _thread_limits  # noqa: F401 — must be the first import; see that module's docstring
+
 import argparse
 import gc
 

@@ -53,9 +53,30 @@ RARE_TOKEN_MAX_DOC_FREQ = 0.01
 # inverted-index-style sparse matmul in _sparse_topk_pairs sub-quadratic.
 # Fuzzy/typo tolerance that char n-grams would have caught is still covered
 # by rare_token (channel 3) and the embedding channel (channel 9).
-TFIDF_TOP_K = 20                  # neighbors retrieved per S1 row, per TF-IDF channel
+# TFIDF_TOP_K=40, chosen via benchmark_topk.py on a 15K-entity India sample:
+# recall@20=66.63%, recall@40=69.03% (+2.40pts), recall@60=69.95% (+0.93pts
+# more) — real but diminishing gain past 40, and 60 nearly doubles candidate
+# volume/query time for well under 1 point of additional recall. ~30% of
+# true matches aren't retrievable by name-only word TF-IDF at ANY k (rank
+# >=60 in the same benchmark) — that gap is expected to be covered by the
+# other 8 channels (exact_name/suffix_normalized/rare_token/postal/numeric/
+# embedding/address_tfidf/composite_tfidf), not by raising k further.
+TFIDF_TOP_K = 40
 TFIDF_MIN_DF = 1
-TFIDF_MAX_FEATURES = 50_000       # cap vocabulary size per country partition (memory guard)
+# max_df=1.0 (no exclusion) + max_features=50_000 — Config A from
+# benchmark_tfidf_configs.py's vocabulary sweep, which tied for BEST
+# retrieval recall (66.66%) among 10 tested configs (max_df in {1.0, 0.02},
+# max_features in {50k..300k}, min_df in {1,2,5}, word 1-gram/2-gram, char
+# 3-5/3-6-gram). Counterintuitively, excluding common terms via max_df=0.02
+# measured slightly WORSE recall than keeping them (64.7% vs 66.66%) — for
+# many true matches, shared generic words like "private"/"limited" still
+# contribute real signal in combination with the rest of the name vector,
+# so removing them loses information rather than adding selectivity. Char
+# n-grams (3-5, 3-6) measured no recall benefit over word-level despite
+# 10-15x higher fit/query cost, so they are not used for word_tfidf.
+TFIDF_MAX_DF = 1.0
+TFIDF_MAX_FEATURES = 50_000
+TFIDF_SUBLINEAR_TF = True
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDING_TOP_K = 20               # neighbors retrieved per S1 row from the ANN index

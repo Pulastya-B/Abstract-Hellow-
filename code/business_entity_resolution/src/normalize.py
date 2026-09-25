@@ -21,8 +21,23 @@ LEGAL_SUFFIXES = [
     "corp", "co", "company", "sarl", "sas", "sa",
 ]
 
-_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WS_RE = re.compile(r"\s+")
+
+# Combining-mark categories (matras, virama, anusvara, ...) that Python's
+# stdlib \w does NOT include even under re.UNICODE. A regex punctuation
+# strip using [^\w\s] therefore treats these as punctuation and blanks them
+# out — for Devanagari (and other Indic scripts built from base consonants +
+# combining vowel signs), this shatters every word into its bare consonant
+# skeleton, e.g. "मार्केटिंग" -> "म र क ट ग". Confirmed directly against
+# India's real S2 data: this was silently destroying the vocabulary that
+# name_tfidf/rare_token/exact_name all depend on, collapsing tens of
+# thousands of Devanagari business names into single-character tokens (a
+# handful of common consonants), which is what made word-level TF-IDF
+# density spike on India specifically (measured 24.7% vs. ~0.2% on ASCII-only
+# synthetic test data) and the whole channel take 24+ hours instead of
+# minutes. `unicodedata.category(ch) in ("Mn", "Mc")` explicitly preserves
+# these mark characters instead of stripping them.
+_COMBINING_MARK_CATEGORIES = frozenset({"Mn", "Mc"})
 _SUFFIX_PATTERNS = [re.compile(r"\b" + re.escape(s) + r"\b") for s in LEGAL_SUFFIXES]
 
 # House/building number: leading digit run at the start of the address, or
@@ -40,12 +55,28 @@ _POSTAL_PATTERNS = {
 _POSTAL_FALLBACK_RE = re.compile(r"\b(\d{5,6})\b")
 
 
+def _strip_punct_unicode_safe(s: str) -> str:
+    """
+    Replaces punctuation with a space while preserving combining marks (see
+    _COMBINING_MARK_CATEGORIES above) — a per-character categorize-and-filter
+    pass instead of a [^\\w\\s] regex, since stdlib \\w silently excludes
+    Devanagari matras/virama and would otherwise shatter Indic-script words.
+    """
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace() or unicodedata.category(ch) in _COMBINING_MARK_CATEGORIES:
+            out.append(ch)
+        else:
+            out.append(" ")
+    return "".join(out)
+
+
 def _normalize_str(s) -> str:
     if s is None:
         return ""
     s = unicodedata.normalize("NFKC", str(s)).lower()
     s = s.replace("&", " and ")
-    s = _PUNCT_RE.sub(" ", s)
+    s = _strip_punct_unicode_safe(s)
     s = _WS_RE.sub(" ", s).strip()
     return s
 
@@ -71,14 +102,30 @@ def _extract_postal(addr: str, country: str) -> str:
 
 
 def _extract_locality(addr: str) -> str:
-    """Last non-numeric comma-separated segment — cheap, country-agnostic
-    proxy for city/region, same rule for every country so France needs no
-    special-casing."""
+    """
+    Second-to-last non-numeric comma-separated segment — cheap, country-
+    agnostic proxy for CITY, same rule for every country so France needs no
+    special-casing.
+
+    Originally took the LAST non-numeric segment, which for addresses
+    formatted "..., City, State" (extremely common in the India partition)
+    grabbed the STATE, not the city — a handful of state names shared by
+    hundreds of thousands of records. That collapsed _numeric_block's
+    (house_number, locality) join key onto a few giant buckets and produced
+    722M candidate rows from a single channel on India alone (blocking.py's
+    per-channel timing log caught this directly). City is far more
+    discriminative than state/region, so preferring the second-to-last
+    segment fixes the join fan-out at the source; _numeric_block's own
+    per-group/cumulative pair-count caps (mirroring _rare_token_block's)
+    are the second, independent line of defense in case any single
+    locality value is still too common for a given country's data.
+    """
     parts = [p.strip() for p in addr.split(",") if p.strip()]
-    for part in reversed(parts):
-        stripped = _WS_RE.sub("", part)
-        if stripped and not stripped.isdigit():
-            return part
+    non_numeric = [p for p in parts if not _WS_RE.sub("", p).isdigit()]
+    if len(non_numeric) >= 2:
+        return non_numeric[-2]
+    if non_numeric:
+        return non_numeric[-1]
     return ""
 
 

@@ -31,6 +31,10 @@ Processed one country at a time (as before) to keep each channel's working
 set bounded to a single partition.
 """
 
+import _thread_limits  # noqa: F401 — must be the first import; see that module's docstring
+
+import time
+
 import numpy as np
 import polars as pl
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -70,6 +74,23 @@ def _empty_hits() -> pl.DataFrame:
     })
 
 
+def _run_channel(name: str, fn, *args, **kwargs) -> pl.DataFrame:
+    """
+    Wraps a channel call with start/finish heartbeat logging. Without this,
+    a slow-but-working channel (e.g. TF-IDF/embedding on a large country
+    partition) prints NOTHING between "blocking by country: 0/1" and the
+    channel finishing — indistinguishable in the log from a genuine hang.
+    This cost real wall-clock time twice already: a run was killed by a
+    labmate who saw no log output for several minutes and assumed it was
+    stuck, when the underlying process may have been working correctly.
+    """
+    tqdm.write(f"    [{name}] starting...")
+    t0 = time.time()
+    result = fn(*args, **kwargs)
+    tqdm.write(f"    [{name}] done in {time.time() - t0:.1f}s — {result.height:,} candidate rows")
+    return result
+
+
 # ── Channel 1/2: exact-match blocks ────────────────────────────────────────
 
 def _exact_match_block(s1: pl.DataFrame, ob: pl.DataFrame, key_col: str, method: str) -> pl.DataFrame:
@@ -83,9 +104,59 @@ def _exact_match_block(s1: pl.DataFrame, ob: pl.DataFrame, key_col: str, method:
     )
 
 
+def _capped_join_block(
+    s1: pl.DataFrame, ob: pl.DataFrame, key_cols: list, method: str,
+    max_block_size: int, max_total_pairs: int,
+) -> pl.DataFrame:
+    """
+    Exact-match join on key_cols, with the same two-layer safety cap
+    _rare_token_block uses: drop any single key-value GROUP whose join would
+    exceed max_block_size on either side, then bound the CUMULATIVE join
+    size across all remaining groups to max_total_pairs (smallest/most-
+    discriminative groups kept first).
+
+    Added after _numeric_block (house_number + locality, no cap at all)
+    produced 722M candidate rows from a single country partition — a
+    locality-extraction bug made "locality" collapse onto a handful of
+    Indian state names shared by hundreds of thousands of records, and nothing
+    stopped the resulting (house_number, locality) join from exploding. The
+    locality bug is fixed at the source (normalize.py), but this cap is the
+    second, independent line of defense: any join-based channel needs one,
+    since blocking keys derived from real-world text can degrade unpredictably
+    for reasons that only show up on the full data, not on samples.
+    """
+    s1k = s1.filter(pl.all_horizontal([pl.col(c) != "" for c in key_cols])).select(
+        ["source1_entity_id"] + key_cols
+    )
+    obk = ob.filter(pl.all_horizontal([pl.col(c) != "" for c in key_cols])).select(
+        ["candidate_id", "candidate_source"] + key_cols
+    )
+    if s1k.height == 0 or obk.height == 0:
+        return _empty_hits()
+
+    s1_counts = s1k.group_by(key_cols).len().rename({"len": "n_s1"})
+    ob_counts = obk.group_by(key_cols).len().rename({"len": "n_ob"})
+    sizes = s1_counts.join(ob_counts, on=key_cols, how="inner")
+    sizes = sizes.filter((pl.col("n_s1") <= max_block_size) & (pl.col("n_ob") <= max_block_size))
+    sizes = sizes.with_columns((pl.col("n_s1") * pl.col("n_ob")).alias("pair_count"))
+    sizes = sizes.sort("pair_count").with_columns(pl.col("pair_count").cum_sum().alias("cum_pairs"))
+    safe = sizes.filter(pl.col("cum_pairs") <= max_total_pairs).select(key_cols)
+    if safe.height == 0:
+        return _empty_hits()
+
+    s1k = s1k.join(safe, on=key_cols, how="inner")
+    obk = obk.join(safe, on=key_cols, how="inner")
+
+    joined = s1k.join(obk, on=key_cols, how="inner")
+    return joined.select(["source1_entity_id", "candidate_id", "candidate_source"]).with_columns(
+        pl.lit(method).alias("block_method")
+    )
+
+
 # ── Channel 3: rare-token inverted index ───────────────────────────────────
 
 def _rare_token_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, max_total_pairs: int) -> pl.DataFrame:
+    tqdm.write("      [rare_token] tokenizing...")
     s1_tok = s1.select(["source1_entity_id", "s1_name"]).filter(pl.col("s1_name") != "").with_columns(
         pl.col("s1_name").str.split(" ").alias("tokens")
     ).explode("tokens").filter(pl.col("tokens") != "")
@@ -96,6 +167,7 @@ def _rare_token_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, m
     if s1_tok.height == 0 or ob_tok.height == 0:
         return _empty_hits()
 
+    tqdm.write(f"      [rare_token] computing doc frequency over {s1_tok.height + ob_tok.height:,} token rows...")
     # Document frequency of each token across BOTH sides combined — a token
     # is banned as a standalone key once it's near-universal, not merely
     # because one particular join of it happens to be large.
@@ -111,10 +183,12 @@ def _rare_token_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, m
     informative = doc_freq.filter(pl.col("doc_freq_ratio") <= config.RARE_TOKEN_MAX_DOC_FREQ).select("tokens")
     if informative.height == 0:
         return _empty_hits()
+    tqdm.write(f"      [rare_token] {informative.height:,} informative tokens kept")
 
     s1_tok = s1_tok.join(informative, on="tokens", how="inner")
     ob_tok = ob_tok.join(informative, on="tokens", how="inner")
 
+    tqdm.write("      [rare_token] sizing token groups against pair-count budget...")
     s1_counts = s1_tok.group_by("tokens").len().rename({"len": "n_s1"})
     ob_counts = ob_tok.group_by("tokens").len().rename({"len": "n_ob"})
     sizes = s1_counts.join(ob_counts, on="tokens", how="inner")
@@ -127,6 +201,7 @@ def _rare_token_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, m
 
     s1_tok = s1_tok.join(safe, on="tokens", how="inner")
     ob_tok = ob_tok.join(safe, on="tokens", how="inner")
+    tqdm.write(f"      [rare_token] joining {safe.height:,} safe token keys...")
 
     joined = s1_tok.join(ob_tok, on="tokens", how="inner")
     return joined.select(["source1_entity_id", "candidate_id", "candidate_source"]).unique().with_columns(
@@ -175,7 +250,12 @@ def _sparse_topk_pairs(query_matrix, corpus_matrix, top_k, chunk_size):
     corpus_T = corpus_matrix.T.tocsr()
 
     all_rows, all_cols = [], []
-    for start in range(0, n_query, chunk_size):
+    n_chunks = max(1, (n_query + chunk_size - 1) // chunk_size)
+    chunk_starts = tqdm(
+        range(0, n_query, chunk_size), total=n_chunks, desc="      tfidf chunks", leave=False,
+        mininterval=config.TQDM_MININTERVAL,
+    ) if n_chunks > 1 else range(0, n_query, chunk_size)
+    for start in chunk_starts:
         end = min(start + chunk_size, n_query)
         chunk = query_matrix[start:end]
         sims = chunk.dot(corpus_T).tocsr()  # SPARSE result — cost ~ shared n-grams only
@@ -205,13 +285,18 @@ def _tfidf_topk_block(
     if not s1_texts or not ob_texts:
         return _empty_hits()
 
-    # word-level, not char n-gram — see config.py's TFIDF_TOP_K comment for
-    # why: char n-grams measured ~98% pairwise density for short business
-    # names, which is O(n_query x n_corpus) no matter how it's computed and
-    # never finishes at India/US scale. Word vocab stays genuinely sparse.
+    # word-level, not char n-gram — see config.py's TFIDF_TOP_K/TFIDF_MAX_DF
+    # comments for the full benchmark trail: char n-grams measured ~98%
+    # pairwise density for short business names (O(n_query x n_corpus)
+    # regardless of implementation, never finishes at India/US scale) AND no
+    # recall benefit over word-level once real data was tested. Config A
+    # (max_df=1.0, no common-term exclusion) tied for best measured recall
+    # among 10 vocabulary configs tested via benchmark_tfidf_configs.py.
     vectorizer = TfidfVectorizer(
         analyzer="word", ngram_range=(1, 1),
-        min_df=config.TFIDF_MIN_DF, max_features=config.TFIDF_MAX_FEATURES,
+        min_df=config.TFIDF_MIN_DF, max_df=config.TFIDF_MAX_DF,
+        max_features=config.TFIDF_MAX_FEATURES, sublinear_tf=config.TFIDF_SUBLINEAR_TF,
+        dtype=np.float32,
     )
     try:
         ob_matrix = vectorizer.fit_transform(ob_texts).tocsr()
@@ -241,22 +326,13 @@ def _tfidf_topk_block(
 
 # ── Channel 7/8: postal / numeric exact blocks ─────────────────────────────
 
-def _postal_block(s1: pl.DataFrame, ob: pl.DataFrame) -> pl.DataFrame:
-    return _exact_match_block(s1, ob, "postal_code", "postal")
+def _postal_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, max_total_pairs: int) -> pl.DataFrame:
+    return _capped_join_block(s1, ob, ["postal_code"], "postal", max_block_size, max_total_pairs)
 
 
-def _numeric_block(s1: pl.DataFrame, ob: pl.DataFrame) -> pl.DataFrame:
-    s1k = s1.filter((pl.col("house_number") != "") & (pl.col("locality") != "")).select(
-        ["source1_entity_id", "house_number", "locality"]
-    )
-    obk = ob.filter((pl.col("house_number") != "") & (pl.col("locality") != "")).select(
-        ["candidate_id", "candidate_source", "house_number", "locality"]
-    )
-    if s1k.height == 0 or obk.height == 0:
-        return _empty_hits()
-    joined = s1k.join(obk, on=["house_number", "locality"], how="inner")
-    return joined.select(["source1_entity_id", "candidate_id", "candidate_source"]).with_columns(
-        pl.lit("numeric").alias("block_method")
+def _numeric_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, max_total_pairs: int) -> pl.DataFrame:
+    return _capped_join_block(
+        s1, ob, ["house_number", "locality"], "numeric", max_block_size, max_total_pairs,
     )
 
 
@@ -270,16 +346,22 @@ def _embedding_block(
 
     import faiss
 
+    tqdm.write("      [embedding] loading model (first call downloads weights)...")
     model = _get_embedding_model()
+
+    tqdm.write(f"      [embedding] encoding {len(ob_texts):,} corpus texts...")
     ob_emb = model.encode(
-        ob_texts, batch_size=config.EMBEDDING_BATCH_SIZE, show_progress_bar=False,
+        ob_texts, batch_size=config.EMBEDDING_BATCH_SIZE, show_progress_bar=True,
         convert_to_numpy=True, normalize_embeddings=True,
     ).astype("float32")
+    tqdm.write(f"      [embedding] encoding {len(s1_texts):,} query texts...")
     s1_emb = model.encode(
-        s1_texts, batch_size=config.EMBEDDING_BATCH_SIZE, show_progress_bar=False,
+        s1_texts, batch_size=config.EMBEDDING_BATCH_SIZE, show_progress_bar=True,
         convert_to_numpy=True, normalize_embeddings=True,
     ).astype("float32")
 
+    tqdm.write("      [embedding] building FAISS index and searching...")
+    faiss.omp_set_num_threads(8)  # explicit cap — see the module-level OMP_NUM_THREADS comment
     dim = ob_emb.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(ob_emb)
@@ -352,7 +434,8 @@ def generate_candidates(
         tqdm.write(f"  country={country}: {s1c.height:,} S1 x {obc.height:,} candidates")
 
         if "exact_name" in active_channels:
-            hit = _exact_match_block(
+            hit = _run_channel(
+                "exact_name", _exact_match_block,
                 s1c.with_columns(pl.col("s1_name").alias("key")),
                 obc.with_columns(pl.col("cand_name").alias("key")),
                 "key", "exact_name",
@@ -361,7 +444,8 @@ def generate_candidates(
                 results.append(hit)
 
         if "suffix_normalized" in active_channels:
-            hit = _exact_match_block(
+            hit = _run_channel(
+                "suffix_normalized", _exact_match_block,
                 s1c.with_columns(pl.col("s1_core_name").alias("key")),
                 obc.with_columns(pl.col("cand_core_name").alias("key")),
                 "key", "suffix_normalized",
@@ -370,22 +454,23 @@ def generate_candidates(
                 results.append(hit)
 
         if "rare_token" in active_channels:
-            hit = _rare_token_block(s1c, obc, max_block_size, max_total_pairs)
+            hit = _run_channel("rare_token", _rare_token_block, s1c, obc, max_block_size, max_total_pairs)
             if hit.height:
                 results.append(hit)
 
         if "postal" in active_channels:
-            hit = _postal_block(s1c, obc)
+            hit = _run_channel("postal", _postal_block, s1c, obc, max_block_size, max_total_pairs)
             if hit.height:
                 results.append(hit)
 
         if "numeric" in active_channels:
-            hit = _numeric_block(s1c, obc)
+            hit = _run_channel("numeric", _numeric_block, s1c, obc, max_block_size, max_total_pairs)
             if hit.height:
                 results.append(hit)
 
         if "name_tfidf" in active_channels:
-            hit = _tfidf_topk_block(
+            hit = _run_channel(
+                "name_tfidf", _tfidf_topk_block,
                 s1c["source1_entity_id"].to_list(), s1c["s1_name"].to_list(),
                 obc["candidate_id"].to_list(), obc["candidate_source"].to_list(), obc["cand_name"].to_list(),
                 config.TFIDF_TOP_K, "name_tfidf",
@@ -394,7 +479,8 @@ def generate_candidates(
                 results.append(hit)
 
         if "address_tfidf" in active_channels:
-            hit = _tfidf_topk_block(
+            hit = _run_channel(
+                "address_tfidf", _tfidf_topk_block,
                 s1c["source1_entity_id"].to_list(), s1c["s1_addr"].to_list(),
                 obc["candidate_id"].to_list(), obc["candidate_source"].to_list(), obc["cand_addr"].to_list(),
                 config.TFIDF_TOP_K, "address_tfidf",
@@ -405,7 +491,8 @@ def generate_candidates(
         if "composite_tfidf" in active_channels:
             s1_comp = (s1c["s1_name"] + " " + s1c["s1_addr"]).to_list()
             ob_comp = (obc["cand_name"] + " " + obc["cand_addr"]).to_list()
-            hit = _tfidf_topk_block(
+            hit = _run_channel(
+                "composite_tfidf", _tfidf_topk_block,
                 s1c["source1_entity_id"].to_list(), s1_comp,
                 obc["candidate_id"].to_list(), obc["candidate_source"].to_list(), ob_comp,
                 config.TFIDF_TOP_K, "composite_tfidf",
@@ -418,7 +505,8 @@ def generate_candidates(
             if partition_rows <= config.EMBEDDING_MAX_PARTITION_ROWS:
                 s1_comp = (s1c["s1_name"] + " " + s1c["s1_addr"]).to_list()
                 ob_comp = (obc["cand_name"] + " " + obc["cand_addr"]).to_list()
-                hit = _embedding_block(
+                hit = _run_channel(
+                    "embedding", _embedding_block,
                     s1c["source1_entity_id"].to_list(), s1_comp,
                     obc["candidate_id"].to_list(), obc["candidate_source"].to_list(), ob_comp,
                     config.EMBEDDING_TOP_K,

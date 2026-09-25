@@ -15,7 +15,10 @@ parquet chunk and freeing memory before moving to the next — unchanged from
 v3, this part was never the source of the validation bias.
 """
 
+import _thread_limits  # noqa: F401 — must be the first import; see that module's docstring
+
 import gc
+import time
 
 import numpy as np
 import polars as pl
@@ -57,9 +60,14 @@ def build_dataset(train_entity_ids: set, val_entity_ids: set, gt_pairs: set):
     val_chunk_dir.mkdir(parents=True, exist_ok=True)
 
     for country in tqdm(countries, desc="processing countries"):
+        country_t0 = time.time()
+        print(f"\n>>> [{country}] starting: normalize -> block -> features -> label", flush=True)
+
         s1c_full = normalize_df(io_utils.scan_source_country(config.TRAIN_S1, country), label=f"train_s1[{country}]")
         s2c = normalize_df(io_utils.scan_source_country(config.TRAIN_S2, country), label=f"train_s2[{country}]")
         s3c = normalize_df(io_utils.scan_source_country(config.TRAIN_S3, country), label=f"train_s3[{country}]")
+        print(f">>> [{country}] normalization done at +{time.time()-country_t0:.0f}s "
+              f"(S1={s1c_full.height:,} S2={s2c.height:,} S3={s3c.height:,})", flush=True)
 
         # Blocking runs over EVERY S1 entity in this country (train + val) —
         # val entities must go through the exact same candidate-generation
@@ -70,12 +78,15 @@ def build_dataset(train_entity_ids: set, val_entity_ids: set, gt_pairs: set):
             max_block_size=config.MAX_BLOCK_SIZE, max_total_pairs=config.MAX_TOTAL_PAIRS,
         )
         n_candidate_pairs_total += candidates_c.height
+        print(f">>> [{country}] blocking done at +{time.time()-country_t0:.0f}s "
+              f"({candidates_c.height:,} candidate pairs)", flush=True)
 
         others_c = pl.concat(
             [s2c.with_columns(pl.lit("S2").alias("src")), s3c.with_columns(pl.lit("S3").alias("src"))],
             how="vertical_relaxed",
         )
         feats_c = add_features(candidates_c, s1c_full, others_c)
+        print(f">>> [{country}] feature engineering done at +{time.time()-country_t0:.0f}s", flush=True)
 
         labels = [
             1 if (s1id, cid) in gt_pairs else 0
@@ -90,6 +101,8 @@ def build_dataset(train_entity_ids: set, val_entity_ids: set, gt_pairs: set):
 
         train_feats_c.write_parquet(config.TRAIN_CHUNK_DIR / f"{country}.parquet")
         val_feats_c.write_parquet(val_chunk_dir / f"{country}.parquet")
+        print(f">>> [{country}] FINISHED in {time.time()-country_t0:.0f}s total "
+              f"({sum(labels):,} true pairs recalled)", flush=True)
 
         del s1c_full, s2c, s3c, candidates_c, others_c, feats_c, labels, val_feats_c, train_feats_c
         gc.collect()
@@ -166,15 +179,18 @@ def train_model():
     X_train = train_rows.select(FEATURE_COLS).to_numpy().astype("float64")
     y_train = train_rows["label"].to_numpy()
 
-    print("Training LightGBM...")
+    print(f"Training LightGBM on {X_train.shape[0]:,} rows x {X_train.shape[1]} features...", flush=True)
+    t0 = time.time()
     model = lgb.LGBMClassifier(
         n_estimators=500,
         learning_rate=0.05,
         num_leaves=63,
         objective="binary",
         random_state=config.RANDOM_SEED,
+        verbose=1,
     )
     model.fit(X_train, y_train)
+    print(f"LightGBM training done in {time.time()-t0:.0f}s", flush=True)
 
     print(f"Scoring VAL candidates ({val_candidates.height:,} rows, "
           f"{val_candidates['source1_entity_id'].n_unique():,} entities with >=1 candidate)...")
