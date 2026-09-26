@@ -29,6 +29,7 @@ Usage (run from anywhere):
 """
 
 import argparse
+import multiprocessing as mp
 import os
 import re
 import time
@@ -244,7 +245,12 @@ def run_chunks(Q, q, XT, s1, n_jobs, model_path, desc):
         _init_worker(*initargs)
         results = [_process_chunk(t) for t in tqdm(tasks, desc=desc, mininterval=10)]
     else:
-        with ProcessPoolExecutor(max_workers=n_jobs, initializer=_init_worker, initargs=initargs) as ex:
+        # "spawn", not Linux's default fork: after the parent has trained LightGBM,
+        # its OpenMP runtime is not fork-safe, and forked workers hang forever on
+        # their first booster.predict (observed: stuck at 0% on the first test chunk).
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx,
+                                 initializer=_init_worker, initargs=initargs) as ex:
             results = list(tqdm(ex.map(_process_chunk, tasks), total=len(tasks), desc=desc, mininterval=10))
     return tuple(np.concatenate([r[k] for r in results]) for k in range(3))
 
