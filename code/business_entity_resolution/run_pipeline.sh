@@ -10,7 +10,7 @@ DATA="${DATA:?set DATA to the folder that contains train/ and test/}"
 OUT="${OUT:?set OUT to a NEW output folder (caches from older code versions are not compatible)}"
 JOBS="${JOBS:-32}"
 MAX_DF="${MAX_DF:-0.05}"
-US_SAMPLE="${US_SAMPLE:-300000}"
+US_SAMPLE="${US_SAMPLE:-600000}"
 mkdir -p "$OUT"
 LOG="$OUT/pipeline.log"
 FM=(python "$HERE/src/fast_match.py" --data-dir "$DATA" --out-dir "$OUT" --n-jobs "$JOBS")

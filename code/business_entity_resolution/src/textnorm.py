@@ -115,6 +115,63 @@ def skeleton(s):
     return " ".join(words)
 
 
+# ── names: core tokens ───────────────────────────────────────────────────────
+#
+# The error analysis showed two failure modes that whole-string similarity can't see:
+#  - true matches with name noise: "alampataanimal.com" vs "Alampata Animal Pvt. Ltd.",
+#    "YB Sreivsesmrvtae Ltd" vs "YB Servicesprivate Ltd", "[CENTER]", "M/s", "Private Private"
+#  - sister companies at the same address: "Solutions Mindtrack Horologicals Overseas [LLP]" vs
+#    "... Horologicals LLP" (token_set_ratio 100, but "Overseas" says it's a different business)
+# So names are reduced to their distinctive core tokens, matched word by word (typo- and
+# shuffle-tolerant), and whatever is left UNMATCHED on either side becomes the signal.
+
+_FILLER = {
+    "pvt", "private", "ltd", "limited", "llp", "llc", "inc", "incorporated", "corp", "corporation", "co", "company",
+    "sarl", "sas", "sasu", "sa", "eurl", "snc", "ei", "center", "centre", "mr", "mrs", "ms", "m", "s", "the", "and",
+    "of", "www", "com", "net", "org", "india", "france", "usa", "us",
+}
+_DOMAIN = re.compile(r"\.(?:co\.in|com|in|net|org|biz|info|fr|us)\b")
+
+
+def name_core(name):
+    """Distinctive name tokens, in order, deduplicated: legal forms, fillers, domains and numbers removed."""
+    s = _DOMAIN.sub(" ", ascii_fold(name).replace("www.", " "))
+    seen, out = set(), []
+    for t in _NON_ALNUM.sub(" ", s).split():
+        if t not in _FILLER and not t.isdigit() and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _tok_match(a, b, ratio):
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4:
+        return False
+    return ratio(a, b) >= 85 or ratio("".join(sorted(a)), "".join(sorted(b))) >= 90  # typo / letter shuffle
+
+
+def core_compare(qa, sb, idf, default_idf, ratio, partial):
+    """
+    -> (unmatched record tokens, unmatched S1 tokens, max rarity of each unmatched side,
+        share of record tokens matched, similarity of the space-less cores).
+    Rarity is IDF over S1 names: an unmatched rare word ("overseas") means a different business far more
+    than an unmatched common one ("traders"). The space-less comparison catches glued names
+    ("alampataanimal" vs "alampata animal").
+    """
+    if not qa or not sb:
+        return -1.0, -1.0, -1.0, -1.0, -1.0, -1.0
+    mq = [any(_tok_match(t, u, ratio) for u in sb) for t in qa]
+    ms = [any(_tok_match(u, t, ratio) for t in qa) for u in sb]
+    xq = [t for t, m in zip(qa, mq) if not m]
+    xs = [u for u, m in zip(sb, ms) if not m]
+    return (float(len(xq)), float(len(xs)),
+            max((idf.get(t, default_idf) for t in xq), default=0.0),
+            max((idf.get(u, default_idf) for u in xs), default=0.0),
+            sum(mq) / len(qa), float(partial("".join(qa), "".join(sb))))
+
+
 # ── addresses ────────────────────────────────────────────────────────────────
 
 _HOUSE = re.compile(r"\d+[a-z]?(?:\s*[-/]\s*\d+[a-z]?)*")
