@@ -2,4 +2,6 @@ polars
 rapidfuzz
 lightgbm
 numpy
+scipy
+scikit-learn
 tqdm
