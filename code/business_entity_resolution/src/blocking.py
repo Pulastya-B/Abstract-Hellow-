@@ -48,7 +48,7 @@ import config
 TFIDF_QUERY_CHUNK_SIZE = 2000
 
 _ALL_CHANNELS = [
-    "exact_name", "suffix_normalized", "rare_token", "name_tfidf",
+    "exact_name", "suffix_normalized", "rare_token", "char_qgram", "name_tfidf",
     "address_tfidf", "composite_tfidf", "postal", "numeric", "embedding",
 ]
 
@@ -206,6 +206,98 @@ def _rare_token_block(s1: pl.DataFrame, ob: pl.DataFrame, max_block_size: int, m
     joined = s1_tok.join(ob_tok, on="tokens", how="inner")
     return joined.select(["source1_entity_id", "candidate_id", "candidate_source"]).unique().with_columns(
         pl.lit("rare_token").alias("block_method")
+    )
+
+
+# ── Char q-gram inverted-index retrieval ────────────────────────────────────
+#
+# Sprint-mode addition: word-level TF-IDF/rare_token miss transliteration
+# variants and typos that share no whole word at all. Full char n-gram TF-IDF
+# (dense cosine) was already proven too slow (~98% pairwise density on short
+# business names). This channel gets fuzzy/typo-tolerant matching a
+# different way: an inverted index over char n-grams with explicit IDF-like
+# weighting and a document-frequency exclusion for near-universal grams
+# (mirrors _rare_token_block's proven-fast Polars-join pattern instead of a
+# dense similarity matrix), ranking candidates by summed weight of SHARED
+# grams only — cost scales with actual gram overlap, not full n_s1 x n_ob.
+
+def _extract_qgrams(name_col: str, n: int) -> pl.Expr:
+    """Character n-grams over a name, via n shifted-substring columns unioned
+    — avoids a Python-level sliding-window loop over every row."""
+    length = pl.col(name_col).str.len_chars()
+    grams = [pl.col(name_col).str.slice(i, n) for i in range(0, 30)]  # cap at 30 positions; names are short
+    return pl.concat_list(grams).list.eval(pl.element().filter(pl.element().str.len_chars() == n))
+
+
+def _char_qgram_block(
+    s1: pl.DataFrame, ob: pl.DataFrame, name_col_s1: str, name_col_ob: str,
+    top_k: int, max_doc_freq: float = 0.05,
+    max_block_size: int = 5000, max_total_pairs: int = 3_000_000,
+) -> pl.DataFrame:
+    s1n = s1.select(["source1_entity_id", pl.col(name_col_s1).alias("name")]).filter(pl.col("name") != "")
+    obn = ob.select(["candidate_id", "candidate_source", pl.col(name_col_ob).alias("name")]).filter(pl.col("name") != "")
+    if s1n.height == 0 or obn.height == 0:
+        return _empty_hits()
+
+    def _grams_df(df: pl.DataFrame, id_cols: list, n_values: tuple) -> pl.DataFrame:
+        parts = []
+        for n in n_values:
+            g = df.select(id_cols + [_extract_qgrams("name", n).alias("grams")]).explode("grams")
+            parts.append(g.filter(pl.col("grams").is_not_null()))
+        return pl.concat(parts, how="vertical_relaxed").unique()
+
+    s1_grams = _grams_df(s1n, ["source1_entity_id"], (3, 4))
+    ob_grams = _grams_df(obn, ["candidate_id", "candidate_source"], (3, 4))
+    if s1_grams.height == 0 or ob_grams.height == 0:
+        return _empty_hits()
+
+    # IDF-like weighting + exclusion of near-universal grams, computed over
+    # the corpus side (same spirit as _rare_token_block's doc-frequency ban,
+    # applied to grams instead of whole words).
+    n_ob_docs = obn.height
+    gram_df = ob_grams.group_by("grams").agg(pl.col("candidate_id").n_unique().alias("df"))
+    gram_df = gram_df.with_columns((pl.col("df") / n_ob_docs).alias("doc_freq_ratio"))
+    gram_df = gram_df.filter(pl.col("doc_freq_ratio") <= max_doc_freq)
+    if gram_df.height == 0:
+        return _empty_hits()
+    gram_df = gram_df.with_columns((-(pl.col("doc_freq_ratio").log())).alias("idf_weight"))
+    gram_weights = gram_df.select(["grams", "idf_weight"])
+
+    s1_grams = s1_grams.join(gram_weights, on="grams", how="inner")
+    ob_grams = ob_grams.join(gram_weights, on="grams", how="inner")
+    if s1_grams.height == 0 or ob_grams.height == 0:
+        return _empty_hits()
+
+    # Same two-layer join-size cap as _rare_token_block/_capped_join_block:
+    # doc-freq filtering alone doesn't bound join size — a gram surviving the
+    # doc-freq cutoff can still individually connect thousands of S1 rows to
+    # thousands of corpus rows (small alphabet -> few possible 3/4-grams,
+    # each shared by many names). This is what made the first version of this
+    # channel hang past 120s on a mere 20K x 100K synthetic test.
+    s1_counts = s1_grams.group_by("grams").len().rename({"len": "n_s1"})
+    ob_counts = ob_grams.group_by("grams").len().rename({"len": "n_ob"})
+    sizes = s1_counts.join(ob_counts, on="grams", how="inner")
+    sizes = sizes.filter((pl.col("n_s1") <= max_block_size) & (pl.col("n_ob") <= max_block_size))
+    sizes = sizes.with_columns((pl.col("n_s1") * pl.col("n_ob")).alias("pair_count"))
+    sizes = sizes.sort("pair_count").with_columns(pl.col("pair_count").cum_sum().alias("cum_pairs"))
+    safe_grams = sizes.filter(pl.col("cum_pairs") <= max_total_pairs).select("grams")
+    if safe_grams.height == 0:
+        return _empty_hits()
+
+    s1_grams = s1_grams.join(safe_grams, on="grams", how="inner")
+    ob_grams = ob_grams.join(safe_grams, on="grams", how="inner")
+
+    joined = s1_grams.join(ob_grams, on="grams", how="inner")
+    scored = joined.group_by(["source1_entity_id", "candidate_id"]).agg([
+        pl.col("candidate_source").first(),
+        pl.col("idf_weight").sum().alias("score"),
+    ])
+
+    scored = scored.sort(["source1_entity_id", "score"], descending=[False, True])
+    top = scored.group_by("source1_entity_id", maintain_order=True).head(top_k)
+
+    return top.select(["source1_entity_id", "candidate_id", "candidate_source"]).with_columns(
+        pl.lit("char_qgram").alias("block_method")
     )
 
 
@@ -455,6 +547,14 @@ def generate_candidates(
 
         if "rare_token" in active_channels:
             hit = _run_channel("rare_token", _rare_token_block, s1c, obc, max_block_size, max_total_pairs)
+            if hit.height:
+                results.append(hit)
+
+        if "char_qgram" in active_channels:
+            hit = _run_channel(
+                "char_qgram", _char_qgram_block, s1c, obc, "s1_name", "cand_name",
+                config.CHAR_QGRAM_TOP_K, config.CHAR_QGRAM_MAX_DOC_FREQ,
+            )
             if hit.height:
                 results.append(hit)
 

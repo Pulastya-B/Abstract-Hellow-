@@ -43,6 +43,12 @@ MAX_TOTAL_PAIRS = 3_000_000     # safety cap: cumulative join size across ALL gr
 # in one particular pairing, only when the token itself is near-universal.
 RARE_TOKEN_MAX_DOC_FREQ = 0.01
 
+# Char q-gram inverted-index channel (sprint-mode addition, replaces dense
+# char-n-gram TF-IDF which was already proven too slow/dense at scale). K=50
+# per the time-boxed spec: not comparing 50 vs 100, ship one reasonable value.
+CHAR_QGRAM_TOP_K = 50
+CHAR_QGRAM_MAX_DOC_FREQ = 0.05
+
 # Word-level (not char n-gram) TF-IDF: char n-grams for short business names
 # were measured at ~98% pairwise density (nearly every pair shares some
 # 2-4-char sequence) — brute cosine over that is O(n_query x n_corpus)
@@ -102,17 +108,17 @@ EMBEDDING_MAX_PARTITION_ROWS = 1_000_000
 
 RECALL_TARGET_PCT = 97.0          # do not proceed to matcher training below this
 
-# SPRINT MODE (5-hour deadline to submission #2): name_tfidf ran at 154s/chunk
-# (~19h ETA) on the full India partition at full scale — far slower than the
-# few-seconds/chunk measured on the 35K-entity sample, almost certainly due
-# to heavy contention on this shared box. Rather than lose more of the time
-# budget diagnosing it, drop all 3 TF-IDF channels for this iteration and use
-# only the 5 fastest channels (all measured in single-digit seconds even at
-# full scale: exact_name, suffix_normalized, rare_token, postal, numeric).
-# train.py/infer.py pass this explicitly to generate_candidates(channels=...)
-# instead of the full _ALL_CHANNELS. Revisit once there's time to find out
-# whether the TF-IDF slowdown was transient contention or a real regression.
-ACTIVE_CHANNELS = ["exact_name", "suffix_normalized", "rare_token", "postal", "numeric"]
+# SPRINT MODE (submission #2): name_tfidf ran at 154s/chunk (~19h ETA) on the
+# full India partition at full scale — far slower than the few-seconds/chunk
+# measured on the 35K-entity sample, almost certainly due to heavy contention
+# on this shared box. All 3 TF-IDF channels are dropped for this iteration.
+# char_qgram was added and benchmarked separately (benchmark_qgram.py):
+# measured +4.69 points of incremental recall (67.17% -> 71.87% on the
+# representative sample) for an estimated ~56min US + ~31min India full-scale
+# cost — a worthwhile trade given the remaining time budget, so it's frozen
+# into the active channel set. train.py/infer.py pass this explicitly to
+# generate_candidates(channels=...) instead of the full _ALL_CHANNELS.
+ACTIVE_CHANNELS = ["exact_name", "suffix_normalized", "rare_token", "char_qgram", "postal", "numeric"]
 
 # tqdm refresh throttle: some notebook/terminal output panes don't support
 # carriage-return line overwriting, so every refresh becomes a new printed

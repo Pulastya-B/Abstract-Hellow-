@@ -74,4 +74,10 @@ def write_results(all_s1_ids: pl.Series, pairs: pl.DataFrame, path, list_col: st
     path = str(path)
     import os
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    full.write_csv(path, separator="\t")
+    # quote_style="never": Polars' default quoting wraps an empty string in
+    # literal "" characters (two double-quotes), not a truly empty field.
+    # The validator's plain split(",") then reads that quoted-empty as a
+    # single garbage "ID" (literally '""'), which fails the S2-/S3- prefix
+    # check on every true singleton row. Confirmed directly against
+    # validate_submission.py's output on the first full-scale inference run.
+    full.write_csv(path, separator="\t", quote_style="never")
