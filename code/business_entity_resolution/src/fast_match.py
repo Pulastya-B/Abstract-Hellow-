@@ -26,7 +26,9 @@ Usage, v2 (cached; retrieval runs once, everything after it takes minutes):
   python fast_match.py --data-dir D --out-dir O --stage extract --split train --countries US --sample 300000
   python fast_match.py --data-dir D --out-dir O --stage extract --split test
   python fast_match.py --data-dir D --out-dir O --stage fit       # exact leaderboard metric + rule tuning
+  python fast_match.py --data-dir D --out-dir O --stage analyze   # error types + examples on held-out train
   python fast_match.py --data-dir D --out-dir O --stage predict   # writes both submission TSVs
+  (or run all of it: bash ../run_pipeline.sh)
 
 Usage, v1 (single run, no cache; produced the 0.928 submission):
   python fast_match.py --data-dir /path/to/dataset --out-dir /path/to/output --n-jobs 24
@@ -52,6 +54,8 @@ from rapidfuzz.utils import default_process
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
+from textnorm import address_parts, house_match, skeleton
+
 TOKEN_PATTERN = r"(?u)\b\w+\b"
 MAX_DF = 0.05           # drop tokens in >5% of a country's S1 docs ("road", state codes, "pvt")
 BM25_K1 = 1.2
@@ -69,6 +73,10 @@ PAIR_FEATURES = [
     "num_jacc", "num_first_eq", "name_len_ratio",
     "name_tset_gap_to_best", "addr_tset_gap_to_best",
     "q_addr_empty", "q_nonlatin", "s_nonlatin", "is_s2",
+    # v3: script-independent names (textnorm.skeleton), address parts, competition among candidates
+    "name_skel_tset", "name_skel_ratio", "addr_skel_tset",
+    "house_match", "seg_jacc", "state_match", "postal_match",
+    "name_skel_gap_to_best", "addr_skel_gap_to_best", "house_dupes", "n_strong_addr",
 ]
 COL = {f: i for i, f in enumerate(PAIR_FEATURES)}
 
@@ -136,14 +144,22 @@ def _digit_info(addr):
 _W = {}
 
 
-def _init_worker(XT, s1_names, s1_addrs, model_path):
+def _addr_info(addr, country):
+    house, segs, state, postal, joined = address_parts(addr, country)
+    return house, segs, state, postal, skeleton(joined)
+
+
+def _init_worker(XT, s1_names, s1_addrs, model_path, country=""):
     # Everything about S1 that every candidate comparison needs is prepared
     # once per worker here, instead of once per (record, candidate) pair.
     _W["XT"] = XT
+    _W["country"] = country
     _W["sn"] = [default_process(x) for x in s1_names]
     _W["sa"] = [default_process(x) for x in s1_addrs]
     _W["s_nonlatin"] = np.array([_nonlatin(x) for x in s1_names], dtype=np.float32)
     _W["s_digits"] = [_digit_info(x) for x in s1_addrs]
+    _W["s_skel"] = [skeleton(x) for x in s1_names]
+    _W["s_addr"] = [_addr_info(x, country) for x in s1_addrs]
     _W["booster"] = lgb.Booster(model_file=model_path) if model_path else None
 
 
@@ -188,11 +204,14 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
     F[:, :, COL["is_s2"]] = q_is_s2[:, None]
 
     sn, sa, s_nonlatin, s_digits = _W["sn"], _W["sa"], _W["s_nonlatin"], _W["s_digits"]
+    s_skel, s_addr, country = _W["s_skel"], _W["s_addr"], _W["country"]
     for i in range(n):
         a_name = default_process(q_names[i])
         a_addr = default_process(q_addrs[i])
         a_empty = not a_addr
         a_digits, a_first = _digit_info(q_addrs[i])
+        a_skel = skeleton(q_names[i])
+        a_house, a_segs, a_state, a_postal, a_addr_skel = _addr_info(q_addrs[i], country)
         F[i, :, COL["q_addr_empty"]] = float(a_empty)
         F[i, :, COL["q_nonlatin"]] = _nonlatin(q_names[i])
         for r in range(TOP_K):
@@ -205,12 +224,20 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
             row[COL["name_tset"]] = fuzz.token_set_ratio(a_name, b_name)
             row[COL["name_ratio"]] = fuzz.ratio(a_name, b_name)
             row[COL["name_partial"]] = fuzz.partial_ratio(a_name, b_name)
+            row[COL["name_skel_tset"]] = fuzz.token_set_ratio(a_skel, s_skel[j])
+            row[COL["name_skel_ratio"]] = fuzz.ratio(a_skel, s_skel[j])
+            b_house, b_segs, b_state, b_postal, b_addr_skel = s_addr[j]
             if not a_empty and b_addr:
                 row[COL["addr_tset"]] = fuzz.token_set_ratio(a_addr, b_addr)
                 row[COL["addr_ratio"]] = fuzz.ratio(a_addr, b_addr)
+                row[COL["addr_skel_tset"]] = fuzz.token_set_ratio(a_addr_skel, b_addr_skel)
+                row[COL["seg_jacc"]] = len(a_segs & b_segs) / max(len(a_segs | b_segs), 1)
+                row[COL["state_match"]] = float(a_state == b_state) if a_state and b_state else -1
             else:
-                row[COL["addr_tset"]] = -1
-                row[COL["addr_ratio"]] = -1
+                for f in ("addr_tset", "addr_ratio", "addr_skel_tset", "seg_jacc", "state_match"):
+                    row[COL[f]] = -1
+            row[COL["house_match"]] = house_match(a_house, b_house)
+            row[COL["postal_match"]] = float(a_postal == b_postal) if a_postal and b_postal else -1
             b_digits, b_first = s_digits[j]
             if a_digits and b_digits:
                 row[COL["num_jacc"]] = len(a_digits & b_digits) / len(a_digits | b_digits)
@@ -221,10 +248,14 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
             la, lb = len(a_name), len(b_name)
             row[COL["name_len_ratio"]] = min(la, lb) / max(la, lb) if max(la, lb) else 0
 
-    # how far each candidate is from the best candidate of the same record
-    for f, gap in (("name_tset", "name_tset_gap_to_best"), ("addr_tset", "addr_tset_gap_to_best")):
+    # competition: how far each candidate is from the record's best candidate on each signal
+    for f, gap in (("name_tset", "name_tset_gap_to_best"), ("addr_tset", "addr_tset_gap_to_best"),
+                   ("name_skel_tset", "name_skel_gap_to_best"), ("addr_skel_tset", "addr_skel_gap_to_best")):
         vals = np.where(valid, F[:, :, COL[f]], -np.inf)
         F[:, :, COL[gap]] = np.where(valid, vals.max(axis=1, keepdims=True) - F[:, :, COL[f]], 0)
+    # ...and how many candidates are equally plausible on address (ambiguous if > 1)
+    F[:, :, COL["house_dupes"]] = ((F[:, :, COL["house_match"]] == 1) & valid).sum(axis=1, keepdims=True)
+    F[:, :, COL["n_strong_addr"]] = ((F[:, :, COL["addr_skel_tset"]] >= 90) & valid).sum(axis=1, keepdims=True)
 
     return F
 
@@ -248,7 +279,8 @@ def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc):
     qs2 = (q["src"] == "S2").to_numpy().astype(np.float32)
     starts = list(range(0, q.height, TASK_CHUNK))
     tasks = [(Q[s:s + TASK_CHUNK], qn[s:s + TASK_CHUNK], qa[s:s + TASK_CHUNK], qs2[s:s + TASK_CHUNK]) for s in starts]
-    initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path)
+    country = s1["country"][0] if s1.height else ""
+    initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path, country)
     if n_jobs <= 1:
         _init_worker(*initargs)
         for s, t in zip(starts, tqdm(tasks, desc=desc, mininterval=10)):
@@ -525,6 +557,10 @@ def load_cache(cache_dir, split, country):
     p = _cache_path(cache_dir, split, country)
     with open(os.path.join(p, "meta.json")) as fh:
         meta = json.load(fh)
+    if meta.get("features") != PAIR_FEATURES:
+        raise SystemExit(f"{p} was built with a different feature set than this code "
+                         f"({len(meta.get('features', []))} vs {len(PAIR_FEATURES)} features). "
+                         f"Use a new --out-dir (or delete that cache) and run --stage extract again.")
     recs = pl.read_parquet(os.path.join(p, "records.parquet"))
     return {
         "dir": p, "meta": meta, "country": country,
@@ -743,6 +779,7 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
             w["probs"] = sum(predict_probs(excl[f], w["cache"], rows_mask=(w["rec_fold"] == f), n_threads=n_threads)
                              for f in (0, 1))
             log(f"[fit {w['cache']['country']}] train world: {(w['owner'] < 0).mean():.1%} of records unowned")
+            np.save(os.path.join(w["cache"]["dir"], "probs_oof.npy"), w["probs"])  # for --stage analyze
         log("[tune] ── as-is train world (for reference only; test has far more unowned records) ──")
         _, raw_score, raw_base, raw_t = tune(worlds)
         result = {"raw_world": {"entity_aware_f05": raw_score, "single_threshold_f05": raw_base,
@@ -769,6 +806,111 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
     with open(os.path.join(out_dir, V2_PARAMS), "w") as fh:
         json.dump(result, fh, indent=2)
     log(f"[fit] saved {V2_MODEL} + {V2_PARAMS} to {out_dir}")
+
+
+def _texts(path, ids):
+    lf = pl.scan_csv(path, separator="\t", infer_schema_length=0, quote_char=None)
+    ids_lf = pl.LazyFrame({"entity_id": sorted(set(ids))})
+    return {r[0]: (r[1], r[2]) for r in lf.join(ids_lf, on="entity_id", how="semi")
+            .select(["entity_id", "business_name", "business_address"]).collect().iter_rows()}
+
+
+def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
+    """Counts and real examples of every error type on held-out train entities (needs --stage fit first)."""
+    owners = load_owners(data_dir)
+    with open(os.path.join(out_dir, V2_PARAMS)) as fh:
+        params = json.load(fh)["params"]
+    train_dir = os.path.join(data_dir, "train")
+    rng = np.random.default_rng(SEED)
+    for country in list_caches(cache_dir, "train"):
+        c = load_cache(cache_dir, "train", country)
+        pp = os.path.join(c["dir"], "probs_oof.npy")
+        if c["meta"]["sampled"] or not os.path.exists(pp):
+            continue
+        lines = []
+
+        def say(msg=""):
+            print(msg, flush=True)
+            lines.append(msg)
+
+        probs, idx, owner = np.load(pp), np.asarray(c["idx"]), owner_rows(c, owners)
+        n_s1, rows = c["meta"]["n_s1"], np.arange(len(idx))
+        e, stage = assign(idx, probs, c["is_s2"], n_s1, **params)
+        best = probs.argmax(axis=1)
+        pick, p_best = idx[rows, best], probs[rows, best]
+        has = owner >= 0
+        owner_rank = np.where((idx == owner[:, None]) & has[:, None], np.arange(TOP_K)[None, :], TOP_K).min(axis=1)
+        in_top = owner_rank < TOP_K
+        indic = np.asarray(c["F"][:, 0, COL["q_nonlatin"]]) > 0
+        cats = {
+            "correct link": has & (e == owner),
+            "REJECTED: owner was the model's pick, below threshold": has & (e < 0) & in_top & (pick == owner),
+            "REJECTED: owner in top-10 but the model preferred another S1": has & (e < 0) & in_top & (pick != owner),
+            "WRONG LINK: assigned to a different S1": has & (e >= 0) & (e != owner),
+            "RETRIEVAL MISS: owner not in top-10, nothing assigned": has & ~in_top & (e < 0),
+            "unowned record, correctly left alone": ~has & (e < 0),
+            "FALSE LINK: unowned record assigned to an S1": ~has & (e >= 0),
+        }
+        say(f"\n══════ ERROR ANALYSIS: train {country} (held-out predictions, params {params}) ══════")
+        say(f"{len(idx):,} records: {has.sum():,} owned, {(~has).sum():,} unowned; "
+            f"{indic.mean():.1%} have an Indian-script name")
+        say(f"{'category':62s} {'records':>10s} {'% of group':>10s} {'% Latin':>8s} {'% Indic':>8s} {'% S2':>6s}")
+        for name, m in cats.items():
+            grp = has if name[0] in "cRW" else ~has
+            lat, ind = grp & ~indic, grp & indic
+            say(f"{name:62s} {m.sum():10,} {m.sum() / max(grp.sum(), 1):10.2%} "
+                f"{(m & lat).sum() / max(lat.sum(), 1):8.2%} {(m & ind).sum() / max(ind.sum(), 1):8.2%} "
+                f"{c['is_s2'][m].mean() if m.any() else 0:6.1%}")
+
+        n_true = np.bincount(owner[has], minlength=n_s1)
+        Fe = entity_f05(e, owner, n_true)
+        sing = n_true == 0
+        say(f"\nper-entity (leaderboard formula, as-is train world): mean F0.5 {Fe.mean():.4f} | "
+            f"singletons {Fe[sing].mean():.3f} ({sing.sum():,}) | non-singletons {Fe[~sing].mean():.3f}")
+        lost = 1 - Fe
+        say(f"points lost: {lost.sum() / len(Fe):.4f} total = singletons given a false link "
+            f"{lost[sing].sum() / len(Fe):.4f} + real entities scoring 0 {lost[~sing & (Fe == 0)].sum() / len(Fe):.4f} "
+            f"+ partly-found real entities {lost[~sing & (Fe > 0)].sum() / len(Fe):.4f}")
+
+        picks = {name: rng.choice(np.where(m)[0], size=min(n_examples, int(m.sum())), replace=False)
+                 for name, m in cats.items() if name[0] in "RWF" and m.any()}
+        all_rows = np.concatenate(list(picks.values())) if picks else np.array([], dtype=np.int64)
+        s1_ids, rec_ids = c["s1_ids"].to_list(), c["rec_ids"].to_list()
+        need_s1 = {s1_ids[j] for i in all_rows for j in (owner[i], pick[i], e[i]) if j >= 0}
+        need_rec = {rec_ids[i] for i in all_rows}
+        s1_txt = _texts(os.path.join(train_dir, "train_source1.tsv"), need_s1)
+        rec_txt = {**_texts(os.path.join(train_dir, "train_source2.tsv"), need_rec),
+                   **_texts(os.path.join(train_dir, "train_source3.tsv"), need_rec)}
+
+        def fmt(t):
+            return f"{t[0]} | {t[1]}" if t else "?"
+
+        def feats(i, r):
+            if r >= TOP_K:
+                return ""
+            f = c["F"][i, r]
+            return ("  ".join(f"{k}={float(f[COL[k]]):.0f}" for k in ("name_tset", "name_skel_tset", "addr_tset",
+                                                                      "addr_skel_tset", "score"))
+                    + "  " + "  ".join(f"{k}={float(f[COL[k]]):.2f}" for k in ("house_match", "seg_jacc")))
+
+        for name, sel in picks.items():
+            say(f"\n── {name}: {len(sel)} random examples ──")
+            for i in sel:
+                o, pk = owner[i], pick[i]
+                say(f"[{'S2' if c['is_s2'][i] else 'S3'}] best p={p_best[i]:.2f} stage={stage[i]} "
+                    f"owner rank={'-' if owner_rank[i] >= TOP_K else owner_rank[i] + 1}")
+                say(f"   record : {fmt(rec_txt.get(rec_ids[i]))}")
+                if o >= 0:
+                    r = owner_rank[i]
+                    say(f"   owner  : {fmt(s1_txt.get(s1_ids[o]))}"
+                        + (f"   (p={probs[i, r]:.2f})  {feats(i, r)}" if r < TOP_K else ""))
+                if pk >= 0 and pk != o:
+                    say(f"   picked : {fmt(s1_txt.get(s1_ids[pk]))}   (p={p_best[i]:.2f})  {feats(i, best[i])}")
+
+        path = os.path.join(out_dir, f"error_analysis_{country}.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        log(f"[analyze] report also written to {path}")
 
 
 def predict_stage(data_dir, cache_dir, out_dir, n_threads, overrides):
@@ -826,8 +968,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", required=True, help="folder containing train/ and test/")
     ap.add_argument("--out-dir", required=True, help="where the model and both TSVs are written")
-    ap.add_argument("--stage", choices=["extract", "fit", "predict", "all", "train", "test"], default="all",
-                    help="v2: extract / fit / predict.  v1 (single run, no cache): all / train / test")
+    ap.add_argument("--stage", choices=["extract", "fit", "analyze", "predict", "all", "train", "test"],
+                    default="all", help="v2: extract / fit / analyze / predict.  v1 (no cache): all / train / test")
+    ap.add_argument("--examples", type=int, default=12, help="v2 analyze: examples printed per error type")
     ap.add_argument("--n-jobs", type=int, default=max(1, min(24, (os.cpu_count() or 2) - 2)))
     ap.add_argument("--train-sample", type=int, default=150_000, help="v1: sampled S2/S3 records per train country")
     ap.add_argument("--max-queries", type=int, default=0, help="v1 smoke test: cap test queries per (country, source)")
@@ -855,6 +998,8 @@ def main():
         extract_stage(args.data_dir, cache_dir, args.split, countries, args.n_jobs, args.sample, args.max_df)
     elif args.stage == "fit":
         fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs, args.noise_shift)
+    elif args.stage == "analyze":
+        analyze_stage(args.data_dir, cache_dir, args.out_dir, args.examples)
     elif args.stage == "predict":
         predict_stage(args.data_dir, cache_dir, args.out_dir, args.n_jobs,
                       {"t_high": args.t_high, "t_sib": args.t_sib, "t_first": args.t_first})
