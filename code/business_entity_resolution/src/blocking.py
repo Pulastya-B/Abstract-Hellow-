@@ -545,3 +545,156 @@ def generate_candidates(
         "source1_entity_id", "candidate_id", "candidate_source",
         "num_blocks_agreeing", "block_exact_match", "block_methods",
     ])
+
+
+# ── Residual embedding rescue ───────────────────────────────────────────────
+#
+# The embedding channel dominates runtime: measured directly on a 35K-S1
+# sample, it took 551s vs. single-digit-seconds-to-low-minutes for every
+# other channel combined, and its cost scales ~linearly with (n_s1 + n_ob)
+# text-encoding volume. At full country scale that extrapolates to ~59 hours
+# PER COUNTRY, infeasible against a 2-day deadline. But embedding is also the
+# only channel that generalizes across script/language boundaries (Devanagari
+# vs. Latin) without relying on shared tokens at all — so dropping it
+# entirely risks losing exactly the hardest, most script-divergent true
+# matches the other 8 (all lexical/token-based) channels structurally cannot
+# find. Rescue policy: run the 8 cheap channels for EVERY S1 (fast), then run
+# embedding only for the subset of S1 entities the cheap channels served
+# poorly — a small fraction of the full corpus, not all of it.
+
+_RESCUE_POLICIES = {"zero_candidates", "low_count", "low_score", "low_agreement"}
+
+
+def _select_rescue_ids(
+    cheap_candidates: pl.DataFrame, all_s1_ids: list, policy: str,
+    min_count_threshold: int = 5, min_agreement_threshold: int = 2,
+) -> set:
+    """
+    Returns the subset of all_s1_ids that should be sent to embedding rescue,
+    per the given policy:
+      - "zero_candidates": only S1s with NO cheap candidates at all (cheapest,
+        most conservative — misses S1s that got a few bad candidates but no
+        good one)
+      - "low_count": S1s with fewer than min_count_threshold cheap candidates
+        (covers zero_candidates plus thin coverage)
+      - "low_agreement": S1s whose best cheap candidate has fewer than
+        min_agreement_threshold independent channels agreeing on it (weak
+        lexical consensus, even if candidate count is nominally high)
+    """
+    all_ids = set(all_s1_ids)
+    if cheap_candidates.height == 0:
+        return all_ids  # nothing cheap found anything; rescue everyone
+
+    if policy == "zero_candidates":
+        has_candidates = set(cheap_candidates["source1_entity_id"].to_list())
+        return all_ids - has_candidates
+
+    if policy == "low_count":
+        counts = cheap_candidates.group_by("source1_entity_id").len()
+        thin = set(counts.filter(pl.col("len") < min_count_threshold)["source1_entity_id"].to_list())
+        has_candidates = set(counts["source1_entity_id"].to_list())
+        return (all_ids - has_candidates) | thin
+
+    if policy == "low_agreement":
+        best_agreement = cheap_candidates.group_by("source1_entity_id").agg(
+            pl.col("num_blocks_agreeing").max().alias("best_agreement")
+        )
+        weak = set(
+            best_agreement.filter(pl.col("best_agreement") < min_agreement_threshold)["source1_entity_id"].to_list()
+        )
+        has_candidates = set(best_agreement["source1_entity_id"].to_list())
+        return (all_ids - has_candidates) | weak
+
+    raise ValueError(f"unknown rescue policy: {policy!r} (expected one of {_RESCUE_POLICIES})")
+
+
+def generate_candidates_with_rescue(
+    s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
+    top_n: int, max_block_size: int = 5000, max_total_pairs: int = 3_000_000,
+    rescue_policy: str = "low_count", min_count_threshold: int = 5, min_agreement_threshold: int = 2,
+    cheap_candidates: pl.DataFrame = None,
+) -> tuple:
+    """
+    Two-stage candidate generation:
+      Stage 1: all 8 cheap (non-embedding) channels, for every S1 entity.
+      Stage 2: embedding retrieval ONLY for S1 entities the rescue policy
+               flags as poorly served by stage 1.
+
+    `cheap_candidates`: pass a previously-computed cheap-channel result
+    (e.g. from a prior generate_candidates(channels=cheap_channels) call) to
+    skip recomputing stage 1 — the 8 cheap channels don't depend on the
+    rescue policy at all, so comparing multiple policies on the same S1/S2/S3
+    input should compute them ONCE and reuse, not once per policy (the 3
+    TF-IDF channels alone measured 5-11 min each at 35K-S1 sample scale).
+
+    Returns (final_candidates, rescue_stats) — rescue_stats has n_rescued,
+    rescue_fraction, and n_total_s1 for reporting.
+    """
+    if cheap_candidates is None:
+        cheap_channels = [c for c in _ALL_CHANNELS if c != "embedding"]
+        cheap_candidates = generate_candidates(
+            s1, s2, s3, top_n=top_n, max_block_size=max_block_size, max_total_pairs=max_total_pairs,
+            channels=cheap_channels,
+        )
+
+    all_s1_ids = s1["entity_id"].to_list()
+    rescue_ids = _select_rescue_ids(
+        cheap_candidates, all_s1_ids, rescue_policy, min_count_threshold, min_agreement_threshold,
+    )
+    tqdm.write(
+        f"  rescue policy={rescue_policy}: {len(rescue_ids):,}/{len(all_s1_ids):,} S1 entities "
+        f"({100*len(rescue_ids)/max(len(all_s1_ids),1):.1f}%) sent to embedding"
+    )
+
+    rescue_stats = {
+        "n_total_s1": len(all_s1_ids), "n_rescued": len(rescue_ids),
+        "rescue_fraction": len(rescue_ids) / max(len(all_s1_ids), 1),
+    }
+
+    if not rescue_ids:
+        return cheap_candidates, rescue_stats
+
+    s1_rescue = s1.filter(pl.col("entity_id").is_in(list(rescue_ids)))
+    embedding_candidates = generate_candidates(
+        s1_rescue, s2, s3, top_n=top_n, max_block_size=max_block_size, max_total_pairs=max_total_pairs,
+        channels=["embedding"],
+    )
+
+    if embedding_candidates.height == 0:
+        return cheap_candidates, rescue_stats
+
+    if cheap_candidates.height == 0:
+        return embedding_candidates, rescue_stats
+
+    # Re-explode each side's already-joined block_methods string back into
+    # individual (S1, candidate, method) rows and re-aggregate from scratch —
+    # simpler and less error-prone than trying to merge two already-aggregated
+    # frames (a pair found by both a cheap channel AND embedding, though rare,
+    # needs its methods unioned and its agreement count recomputed correctly).
+    def _reexplode(df: pl.DataFrame) -> pl.DataFrame:
+        return df.select([
+            "source1_entity_id", "candidate_id", "candidate_source",
+            pl.col("block_methods").str.split(",").alias("block_method"),
+        ]).explode("block_method")
+
+    unioned = pl.concat([_reexplode(cheap_candidates), _reexplode(embedding_candidates)], how="vertical_relaxed")
+
+    agg = unioned.group_by(["source1_entity_id", "candidate_id"]).agg([
+        pl.col("candidate_source").first(),
+        pl.col("block_method").unique().alias("_methods"),
+        pl.col("block_method").n_unique().alias("num_blocks_agreeing"),
+        (pl.col("block_method") == "exact_name").any().alias("block_exact_match"),
+    ])
+    agg = agg.with_columns(pl.col("_methods").list.sort().list.join(",").alias("block_methods")).drop("_methods")
+
+    agg = agg.sort(
+        ["source1_entity_id", "block_exact_match", "num_blocks_agreeing"],
+        descending=[False, True, True],
+    )
+    agg = agg.group_by("source1_entity_id", maintain_order=True).head(top_n)
+
+    final = agg.select([
+        "source1_entity_id", "candidate_id", "candidate_source",
+        "num_blocks_agreeing", "block_exact_match", "block_methods",
+    ])
+    return final, rescue_stats

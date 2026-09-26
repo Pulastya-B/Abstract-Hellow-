@@ -46,6 +46,7 @@ def run_inference():
         candidates_c = generate_candidates(
             s1c, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
             max_block_size=config.MAX_BLOCK_SIZE, max_total_pairs=config.MAX_TOTAL_PAIRS,
+            channels=config.ACTIVE_CHANNELS,
         )
 
         others_c = pl.concat(

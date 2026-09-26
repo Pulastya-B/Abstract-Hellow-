@@ -87,9 +87,32 @@ EMBEDDING_MAX_SEQ_LENGTH = 64       # names + short addresses; keeps encoding fa
 # embedding channel to keep single-box encoding time bounded — the other 8
 # channels still cover it fully, so recall degrades gracefully rather than
 # the run stalling on a multi-hour encode of the largest partition.
-EMBEDDING_MAX_PARTITION_ROWS = 6_000_000
+#
+# SPRINT MODE (5-hour deadline to submission #2): lowered from 6,000,000 to
+# 1,000,000 so embedding is skipped for BOTH US (~7.5M combined) and India
+# (~5M combined) at full scale — measured directly that full embedding
+# extrapolates to ~59h/country, and even India's cheap-only-channel recall
+# (95.80%, measured on a 35K-entity representative sample) is close enough to
+# the 97% target that shipping fast beats chasing the last few points via a
+# channel that cannot finish in the time available. Revisit this cutoff once
+# there's time to properly benchmark the residual-embedding-rescue approach
+# (blocking.generate_candidates_with_rescue), which only embeds a small
+# flagged subset of S1 entities instead of the full corpus.
+EMBEDDING_MAX_PARTITION_ROWS = 1_000_000
 
 RECALL_TARGET_PCT = 97.0          # do not proceed to matcher training below this
+
+# SPRINT MODE (5-hour deadline to submission #2): name_tfidf ran at 154s/chunk
+# (~19h ETA) on the full India partition at full scale — far slower than the
+# few-seconds/chunk measured on the 35K-entity sample, almost certainly due
+# to heavy contention on this shared box. Rather than lose more of the time
+# budget diagnosing it, drop all 3 TF-IDF channels for this iteration and use
+# only the 5 fastest channels (all measured in single-digit seconds even at
+# full scale: exact_name, suffix_normalized, rare_token, postal, numeric).
+# train.py/infer.py pass this explicitly to generate_candidates(channels=...)
+# instead of the full _ALL_CHANNELS. Revisit once there's time to find out
+# whether the TF-IDF slowdown was transient contention or a real regression.
+ACTIVE_CHANNELS = ["exact_name", "suffix_normalized", "rare_token", "postal", "numeric"]
 
 # tqdm refresh throttle: some notebook/terminal output panes don't support
 # carriage-return line overwriting, so every refresh becomes a new printed

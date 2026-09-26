@@ -76,6 +76,7 @@ def build_dataset(train_entity_ids: set, val_entity_ids: set, gt_pairs: set):
         candidates_c = generate_candidates(
             s1c_full, s2c, s3c, top_n=config.TOP_N_CANDIDATES,
             max_block_size=config.MAX_BLOCK_SIZE, max_total_pairs=config.MAX_TOTAL_PAIRS,
+            channels=config.ACTIVE_CHANNELS,
         )
         n_candidate_pairs_total += candidates_c.height
         print(f">>> [{country}] blocking done at +{time.time()-country_t0:.0f}s "
