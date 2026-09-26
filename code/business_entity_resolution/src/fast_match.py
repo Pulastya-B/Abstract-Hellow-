@@ -618,11 +618,30 @@ def entity_f05(assigned_e, owner, n_true):
     return np.where(n_true == 0, (f == 0).astype(np.float64), 1.25 * k / np.maximum(k + f + 0.25 * n_true, 1e-9))
 
 
+def shift_world(w, drop_frac, seed=SEED):
+    """
+    Make a train world look like test: test has 5.75 S2/S3 records per S1 vs 4.68 in train, so
+    at equal matches per S1 (~3.46) ~40% of test records have no owner vs ~26% in train. Removing
+    `drop_frac` of S1 entities from the index while KEEPING their records turns those records into
+    unowned noise that looks exactly like real businesses, the same way test's unowned records do
+    (their S1 entry simply isn't there). drop_frac = 1 - 0.602/0.74 ~= 0.19.
+    """
+    n_s1 = len(w["n_true"])
+    dropped = np.random.default_rng(seed).random(n_s1) < drop_frac
+    idx = w["idx"]
+    gone = (idx >= 0) & dropped[np.maximum(idx, 0)]
+    owner = np.where((w["owner"] >= 0) & dropped[np.maximum(w["owner"], 0)], -1, w["owner"])
+    return dict(w, probs=np.where(gone, 0.0, w["probs"]).astype(np.float32), owner=owner,
+                n_true=np.bincount(owner[owner >= 0], minlength=n_s1), mask=~dropped)
+
+
 def _evaluate(worlds, params):
     tot = cnt = 0
     for w in worlds:
         e, _ = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params)
         F = entity_f05(e, w["owner"], w["n_true"])
+        if w.get("mask") is not None:
+            F = F[w["mask"]]
         tot += F.sum()
         cnt += len(F)
     return tot / cnt
@@ -633,6 +652,8 @@ def _report(worlds, params, label):
         e, stage = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params)
         F = entity_f05(e, w["owner"], w["n_true"])
         sing = w["n_true"] == 0
+        if w.get("mask") is not None:
+            F, sing = F[w["mask"]], sing[w["mask"]]
         log(f"[{label} {w['cache']['country']}] leaderboard-style F0.5={F.mean():.4f} | singletons "
             f"{F[sing].mean():.3f} (n={sing.sum():,}) | non-singletons {F[~sing].mean():.3f}, of which "
             f"{(F[~sing] == 0).mean():.1%} score 0 | links by stage A/B/C: "
@@ -683,7 +704,7 @@ def _fit_lgb(parts, mask_fn, n_threads):
     return m.booster_
 
 
-def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads):
+def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
     owners = load_owners(data_dir)
     rng = np.random.default_rng(SEED)
     parts, worlds = [], []
@@ -721,12 +742,24 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads):
         for w in worlds:
             w["probs"] = sum(predict_probs(excl[f], w["cache"], rows_mask=(w["rec_fold"] == f), n_threads=n_threads)
                              for f in (0, 1))
+            log(f"[fit {w['cache']['country']}] train world: {(w['owner'] < 0).mean():.1%} of records unowned")
+        log("[tune] ── as-is train world (for reference only; test has far more unowned records) ──")
+        _, raw_score, raw_base, raw_t = tune(worlds)
+        result = {"raw_world": {"entity_aware_f05": raw_score, "single_threshold_f05": raw_base,
+                                "single_threshold": raw_t}}
+        if noise_shift > 0:
+            worlds = [shift_world(w, noise_shift) for w in worlds]
+            for w in worlds:
+                log(f"[fit {w['cache']['country']}] test-like world: {noise_shift:.0%} of S1 removed from the index, "
+                    f"{(w['owner'] < 0).mean():.1%} of records now unowned")
+            log("[tune] ── test-like world (these parameters are the ones saved and used) ──")
         params, score, base_score, t_base = tune(worlds)
-        result = {"params": params, "leaderboard_style_f05": score,
-                  "single_threshold_f05": base_score, "single_threshold": t_base,
-                  "evaluated_on": [w["cache"]["country"] for w in worlds]}
-        log(f"[fit] leaderboard-style F0.5 on held-out entities: single threshold {base_score:.4f} -> "
-            f"entity-aware {score:.4f}")
+        result.update({"params": params, "leaderboard_style_f05": score,
+                       "single_threshold_f05": base_score, "single_threshold": t_base, "noise_shift": noise_shift,
+                       "evaluated_on": [w["cache"]["country"] for w in worlds]})
+        log(f"[fit] leaderboard-style F0.5 on held-out entities ({'test-like' if noise_shift > 0 else 'as-is'} world): "
+            f"single threshold {base_score:.4f} -> entity-aware {score:.4f}; "
+            f"old fixed 0.78: {_evaluate(worlds, {'t_high': .78, 't_sib': .78, 't_first': .78, 'sib_other_source': False}):.4f}")
     else:
         log("[fit] WARNING: no full-world train cache (extract one with --split train and no --sample); "
             "cannot evaluate or tune, using the old single threshold 0.78")
@@ -804,6 +837,9 @@ def main():
     ap.add_argument("--sample", type=int, default=0, help="v2 extract: only this many random records per country")
     ap.add_argument("--max-df", type=float, default=V2_MAX_DF, help="v2 extract: BM25 common-word cutoff")
     ap.add_argument("--fit-sample", type=int, default=200_000, help="v2 fit: records per train cache used for fitting")
+    ap.add_argument("--noise-shift", type=float, default=0.19,
+                    help="v2 fit: share of S1 removed from the train world before tuning, so ~40%% of records are "
+                         "unowned like test (0 = tune on the train world as-is)")
     ap.add_argument("--t-high", type=float, help="v2 predict: override the tuned threshold for stage A")
     ap.add_argument("--t-sib", type=float, help="v2 predict: override stage B threshold")
     ap.add_argument("--t-first", type=float, help="v2 predict: override stage C threshold")
@@ -818,7 +854,7 @@ def main():
         countries = [c.strip() for c in args.countries.split(",") if c.strip()]
         extract_stage(args.data_dir, cache_dir, args.split, countries, args.n_jobs, args.sample, args.max_df)
     elif args.stage == "fit":
-        fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs)
+        fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs, args.noise_shift)
     elif args.stage == "predict":
         predict_stage(args.data_dir, cache_dir, args.out_dir, args.n_jobs,
                       {"t_high": args.t_high, "t_sib": args.t_sib, "t_first": args.t_first})
