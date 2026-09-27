@@ -13,6 +13,7 @@ length) stop mattering: `స్వస్తిక్` -> "svastik" -> "svstk" an
 
 import re
 import unicodedata
+from functools import lru_cache
 
 _VOWELS = {
     "A": "a", "AA": "a", "I": "i", "II": "i", "U": "u", "UU": "u", "E": "e", "EE": "e", "AI": "ai",
@@ -144,32 +145,68 @@ def name_core(name):
     return out
 
 
+@lru_cache(maxsize=1_000_000)
+def _word_skeleton(t):
+    return skeleton(t)
+
+
 def _tok_match(a, b, ratio):
     if a == b:
         return True
     if min(len(a), len(b)) < 4:
         return False
-    return ratio(a, b) >= 85 or ratio("".join(sorted(a)), "".join(sorted(b))) >= 90  # typo / letter shuffle
+    if ratio(a, b) >= 85 or ratio("".join(sorted(a)), "".join(sorted(b))) >= 90:  # typo / letter shuffle
+        return True
+    # transliterated English words ("kanstrakshans" vs "constructions", "phud" vs "food")
+    sa, sb = _word_skeleton(a), _word_skeleton(b)
+    return min(len(sa), len(sb)) >= 3 and ratio(sa, sb) >= 80
+
+
+def core_extras(qa, sb, ratio):
+    """-> (share of record tokens matched, unmatched record tokens, unmatched S1 tokens)."""
+    mq = [any(_tok_match(t, u, ratio) for u in sb) for t in qa]
+    xs = [u for u in sb if not any(_tok_match(u, t, ratio) for t in qa)]
+    return sum(mq) / len(qa), [t for t, m in zip(qa, mq) if not m], xs
 
 
 def core_compare(qa, sb, idf, default_idf, ratio, partial):
     """
-    -> (unmatched record tokens, unmatched S1 tokens, max rarity of each unmatched side,
-        share of record tokens matched, similarity of the space-less cores).
+    -> ((unmatched record tokens, unmatched S1 tokens, max rarity of each unmatched side,
+         share of record tokens matched, similarity of the space-less cores), xq, xs).
     Rarity is IDF over S1 names: an unmatched rare word ("overseas") means a different business far more
     than an unmatched common one ("traders"). The space-less comparison catches glued names
     ("alampataanimal" vs "alampata animal").
     """
     if not qa or not sb:
-        return -1.0, -1.0, -1.0, -1.0, -1.0, -1.0
-    mq = [any(_tok_match(t, u, ratio) for u in sb) for t in qa]
-    ms = [any(_tok_match(u, t, ratio) for t in qa) for u in sb]
-    xq = [t for t, m in zip(qa, mq) if not m]
-    xs = [u for u, m in zip(sb, ms) if not m]
+        return (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0), [], []
+    frac, xq, xs = core_extras(qa, sb, ratio)
     return (float(len(xq)), float(len(xs)),
             max((idf.get(t, default_idf) for t in xq), default=0.0),
             max((idf.get(u, default_idf) for u in xs), default=0.0),
-            sum(mq) / len(qa), float(partial("".join(qa), "".join(sb))))
+            frac, float(partial("".join(qa), "".join(sb)))), xq, xs
+
+
+def noise_evidence(xq, xs, vocab):
+    """
+    Learned from train true pairs (fast_match --stage vocab): how often the dataset's noise ADDS each
+    word to a record name ("smt": 100%, "praivet": 100%) or DROPS it from the S1 name ("group": 35%).
+    An unmatched word that noise often adds is harmless; one it never adds ("overseas") signals a
+    different business. -> (min add-rate of record extras, sum of (1 - add-rate), same for S1 extras
+    with drop-rates); -1 / 0 when a side has no extras. Unseen words count as rate 0.
+    """
+    added, dropped = vocab.get("added", {}), vocab.get("dropped", {})
+    aq = [added.get(t, 0.0) for t in xq]
+    ds = [dropped.get(u, 0.0) for u in xs]
+    return (min(aq) if aq else -1.0, sum(1 - r for r in aq),
+            min(ds) if ds else -1.0, sum(1 - r for r in ds))
+
+
+_WORDS = re.compile(r"\w+")
+
+
+def has_repeated_word(name):
+    w = _WORDS.findall(name.lower())
+    return any(a == b for a, b in zip(w, w[1:]))
 
 
 # ── addresses ────────────────────────────────────────────────────────────────

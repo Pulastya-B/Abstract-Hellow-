@@ -22,6 +22,7 @@ Retrieval, feature computation and prediction all run inside the worker
 processes, chunk by chunk, so the whole pipeline scales with --n-jobs.
 
 Usage, v2 (cached; retrieval runs once, everything after it takes minutes):
+  python fast_match.py --data-dir D --out-dir O --stage vocab     # learn which words the noise adds/drops
   python fast_match.py --data-dir D --out-dir O --stage extract --split train --countries India
   python fast_match.py --data-dir D --out-dir O --stage extract --split train --countries US --sample 300000
   python fast_match.py --data-dir D --out-dir O --stage extract --split test
@@ -54,7 +55,8 @@ from rapidfuzz.utils import default_process
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
-from textnorm import address_parts, core_compare, house_match, name_core, skeleton
+from textnorm import (address_parts, core_compare, core_extras, has_repeated_word, house_match, name_core,
+                      noise_evidence, skeleton)
 
 TOKEN_PATTERN = r"(?u)\b\w+\b"
 MAX_DF = 0.05           # drop tokens in >5% of a country's S1 docs ("road", state codes, "pvt")
@@ -80,7 +82,10 @@ PAIR_FEATURES = [
     # v4: distinctive name tokens (textnorm.name_core): what's left unmatched on each side, and how rare
     "core_extra_q", "core_extra_s", "core_extra_q_idf", "core_extra_s_idf", "core_match_frac", "core_nospace",
     "num_common", "q_domain",
+    # v5: learned noise vocabulary (--stage vocab): are the unmatched words ones the noise adds/drops?
+    "extra_q_noise_min", "extra_q_distinct", "extra_s_drop_min", "extra_s_distinct", "q_dup_word",
 ]
+VOCAB_FILE = "noise_vocab.json"
 COL = {f: i for i, f in enumerate(PAIR_FEATURES)}
 
 _DIGITS = re.compile(r"\d+")
@@ -156,11 +161,12 @@ def _addr_info(addr, country):
     return house, segs, state, postal, skeleton(joined)
 
 
-def _init_worker(XT, s1_names, s1_addrs, model_path, country=""):
+def _init_worker(XT, s1_names, s1_addrs, model_path, country="", vocab=None):
     # Everything about S1 that every candidate comparison needs is prepared
     # once per worker here, instead of once per (record, candidate) pair.
     _W["XT"] = XT
     _W["country"] = country
+    _W["vocab"] = vocab or {}
     _W["sn"] = [default_process(x) for x in s1_names]
     _W["sa"] = [default_process(x) for x in s1_addrs]
     _W["s_nonlatin"] = np.array([_nonlatin(x) for x in s1_names], dtype=np.float32)
@@ -220,7 +226,7 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
 
     sn, sa, s_nonlatin, s_digits = _W["sn"], _W["sa"], _W["s_nonlatin"], _W["s_digits"]
     s_skel, s_addr, country = _W["s_skel"], _W["s_addr"], _W["country"]
-    s_core, idf, idf_unseen = _W["s_core"], _W["idf"], _W["idf_unseen"]
+    s_core, idf, idf_unseen, vocab = _W["s_core"], _W["idf"], _W["idf_unseen"], _W["vocab"]
     for i in range(n):
         a_name = default_process(q_names[i])
         a_addr = default_process(q_addrs[i])
@@ -233,6 +239,7 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
         F[i, :, COL["q_addr_empty"]] = float(a_empty)
         F[i, :, COL["q_nonlatin"]] = _nonlatin(q_names[i])
         F[i, :, COL["q_domain"]] = float("www." in low or ".com" in low or ".in" in low)
+        F[i, :, COL["q_dup_word"]] = float(has_repeated_word(q_names[i]))
         for r in range(TOP_K):
             j = idx[i, r]
             if j < 0:
@@ -257,9 +264,11 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
                     row[COL[f]] = -1
             row[COL["house_match"]] = house_match(a_house, b_house)
             row[COL["postal_match"]] = float(a_postal == b_postal) if a_postal and b_postal else -1
+            core_f, xq, xs = core_compare(a_core, s_core[j], idf, idf_unseen, fuzz.ratio, fuzz.partial_ratio)
             (row[COL["core_extra_q"]], row[COL["core_extra_s"]], row[COL["core_extra_q_idf"]],
-             row[COL["core_extra_s_idf"]], row[COL["core_match_frac"]], row[COL["core_nospace"]]) = core_compare(
-                a_core, s_core[j], idf, idf_unseen, fuzz.ratio, fuzz.partial_ratio)
+             row[COL["core_extra_s_idf"]], row[COL["core_match_frac"]], row[COL["core_nospace"]]) = core_f
+            (row[COL["extra_q_noise_min"]], row[COL["extra_q_distinct"]],
+             row[COL["extra_s_drop_min"]], row[COL["extra_s_distinct"]]) = noise_evidence(xq, xs, vocab)
             b_digits, b_first = s_digits[j]
             if a_digits and b_digits:
                 row[COL["num_jacc"]] = len(a_digits & b_digits) / len(a_digits | b_digits)
@@ -297,14 +306,14 @@ def _process_chunk(task):
     return idx, sc, probs.astype(np.float32)
 
 
-def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc):
+def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc, vocab=None):
     """Yields (start_row, result) in row order; result is (idx, sc, F) or (idx, sc, probs)."""
     qn, qa = q["business_name"].to_list(), q["business_address"].to_list()
     qs2 = (q["src"] == "S2").to_numpy().astype(np.float32)
     starts = list(range(0, q.height, TASK_CHUNK))
     tasks = [(Q[s:s + TASK_CHUNK], qn[s:s + TASK_CHUNK], qa[s:s + TASK_CHUNK], qs2[s:s + TASK_CHUNK]) for s in starts]
     country = s1["country"][0] if s1.height else ""
-    initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path, country)
+    initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path, country, vocab)
     if n_jobs <= 1:
         _init_worker(*initargs)
         for s, t in zip(starts, tqdm(tasks, desc=desc, mininterval=10)):
@@ -534,7 +543,12 @@ def list_caches(cache_dir, split):
                   if d.startswith(pre) and os.path.exists(os.path.join(cache_dir, d, "done")))
 
 
-def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df):
+def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df, vocab_path):
+    if not os.path.exists(vocab_path):
+        raise SystemExit(f"{vocab_path} not found: run --stage vocab first (same --out-dir)")
+    with open(vocab_path) as fh:
+        vocab = json.load(fh)
+    log(f"[extract] noise vocabulary: {len(vocab['added']):,} record words, {len(vocab['dropped']):,} S1 words")
     d = os.path.join(data_dir, split)
     s1_path = os.path.join(d, f"{split}_source1.tsv")
     for country in countries or list_countries(s1_path):
@@ -563,7 +577,8 @@ def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df)
         F_mm = np.lib.format.open_memmap(os.path.join(out, "F.npy"), mode="w+", dtype=np.float16,
                                          shape=(n, TOP_K, len(PAIR_FEATURES)))
         Q = encode_queries(vec, q)
-        for s, (idx, _, F) in iter_chunks(Q, q, XT, s1, n_jobs, None, desc=f"extract {split} {country}"):
+        for s, (idx, _, F) in iter_chunks(Q, q, XT, s1, n_jobs, None, desc=f"extract {split} {country}",
+                                          vocab=vocab):
             idx_mm[s:s + len(idx)] = idx
             F_mm[s:s + len(idx)] = F
         idx_mm.flush()
@@ -575,6 +590,55 @@ def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df)
         open(os.path.join(out, "done"), "w").close()
         log(f"[extract {split} {country}] done in {(time.time() - t0) / 60:.1f} min -> {out}")
         del s1, vec, XT, q, Q
+
+
+def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
+    """
+    Learn, from train TRUE pairs, how often the dataset's noise adds each word to a record name and drops
+    each word from an S1 name (measured on 300K pairs: "smt"/"shri"/"praivet"/"limitet" are added ~100% of
+    the times they appear, "group"/"care"/"services" dropped 25-35%). Written to noise_vocab.json.
+    Only words seen >= min_count times are kept, so no single pair's label leaks into a feature.
+    """
+    train_dir = os.path.join(data_dir, "train")
+    owners = load_owners(data_dir)
+    if owners.height > n_pairs:
+        owners = owners.sample(n=n_pairs, seed=SEED)
+
+    def names(fname, ids, id_col):
+        return (pl.scan_csv(os.path.join(train_dir, fname), separator="\t", infer_schema_length=0, quote_char=None)
+                .join(pl.LazyFrame({"entity_id": ids}), on="entity_id", how="semi")
+                .select(pl.col("entity_id").alias(id_col), pl.col("business_name").fill_null(""))
+                .collect())
+
+    cand_ids = owners["cand_id"].to_list()
+    recs = pl.concat([names(f"train_source{k}.tsv", cand_ids, "cand_id") for k in (2, 3)])
+    s1 = names("train_source1.tsv", owners["owner"].unique().to_list(), "owner")
+    pairs = (owners.join(recs.rename({"business_name": "rn"}), on="cand_id")
+             .join(s1.rename({"business_name": "sn"}), on="owner"))
+    log(f"[vocab] learning noise vocabulary from {pairs.height:,} train true pairs")
+
+    added, dropped, rec_tok, s1_tok = {}, {}, {}, {}
+
+    def bump(d, toks):
+        for t in toks:
+            d[t] = d.get(t, 0) + 1
+
+    for rn, sn in tqdm(pairs.select("rn", "sn").iter_rows(), total=pairs.height, desc="vocab", mininterval=10):
+        q, s = name_core(rn), name_core(sn)
+        bump(rec_tok, q)
+        bump(s1_tok, s)
+        if q and s:
+            _, xq, xs = core_extras(q, s, fuzz.ratio)
+            bump(added, xq)
+            bump(dropped, xs)
+    vocab = {"added": {t: added.get(t, 0) / c for t, c in rec_tok.items() if c >= min_count},
+             "dropped": {t: dropped.get(t, 0) / c for t, c in s1_tok.items() if c >= min_count}}
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, VOCAB_FILE), "w") as fh:
+        json.dump(vocab, fh)
+    top = sorted(((r, t) for t, r in vocab["added"].items() if rec_tok[t] >= 200), reverse=True)[:15]
+    log(f"[vocab] {len(vocab['added']):,} record words / {len(vocab['dropped']):,} S1 words kept; most often "
+        f"added by noise: {', '.join(f'{t} {r:.0%}' for r, t in top)}")
 
 
 def load_cache(cache_dir, split, country):
@@ -992,9 +1056,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", required=True, help="folder containing train/ and test/")
     ap.add_argument("--out-dir", required=True, help="where the model and both TSVs are written")
-    ap.add_argument("--stage", choices=["extract", "fit", "analyze", "predict", "all", "train", "test"],
-                    default="all", help="v2: extract / fit / analyze / predict.  v1 (no cache): all / train / test")
+    ap.add_argument("--stage", choices=["vocab", "extract", "fit", "analyze", "predict", "all", "train", "test"],
+                    default="all", help="v2: vocab / extract / fit / analyze / predict.  v1 (no cache): all / train / test")
     ap.add_argument("--examples", type=int, default=12, help="v2 analyze: examples printed per error type")
+    ap.add_argument("--vocab-pairs", type=int, default=2_000_000, help="v2 vocab: train true pairs to learn from")
     ap.add_argument("--n-jobs", type=int, default=max(1, min(24, (os.cpu_count() or 2) - 2)))
     ap.add_argument("--train-sample", type=int, default=150_000, help="v1: sampled S2/S3 records per train country")
     ap.add_argument("--max-queries", type=int, default=0, help="v1 smoke test: cap test queries per (country, source)")
@@ -1019,7 +1084,10 @@ def main():
         if not args.split:
             ap.error("--stage extract needs --split train or --split test")
         countries = [c.strip() for c in args.countries.split(",") if c.strip()]
-        extract_stage(args.data_dir, cache_dir, args.split, countries, args.n_jobs, args.sample, args.max_df)
+        extract_stage(args.data_dir, cache_dir, args.split, countries, args.n_jobs, args.sample, args.max_df,
+                      os.path.join(args.out_dir, VOCAB_FILE))
+    elif args.stage == "vocab":
+        vocab_stage(args.data_dir, args.out_dir, args.vocab_pairs)
     elif args.stage == "fit":
         fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs, args.noise_shift)
     elif args.stage == "analyze":

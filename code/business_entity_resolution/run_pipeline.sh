@@ -20,6 +20,7 @@ run() {
     nice -n 10 "${FM[@]}" "$@" 2>&1 | tee -a "$LOG"
 }
 
+[ -f "$OUT/noise_vocab.json" ] || run --stage vocab
 run --stage extract --split train --countries India --max-df "$MAX_DF"
 run --stage extract --split train --countries US --sample "$US_SAMPLE" --max-df "$MAX_DF"
 run --stage extract --split test --max-df "$MAX_DF"
