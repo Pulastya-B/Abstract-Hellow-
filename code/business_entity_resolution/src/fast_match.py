@@ -641,7 +641,36 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
         f"added by noise: {', '.join(f'{t} {r:.0%}' for r, t in top)}")
 
 
-def load_cache(cache_dir, split, country):
+# Features computed when a cache is LOADED (not stored in it), so they can be added without re-extracting.
+# Records with no address (~3-4%) can only be matched by name, and several S1 entities often share that
+# exact name ("City Constructions LLP" in Delhi and in Gujarat): the model needs to know whether a name is
+# unique among S1 entities (confident) or shared (ambiguous; abstaining is right under F0.5).
+DERIVED_FEATURES = ["s_name_freq", "name_dupes"]
+MODEL_FEATURES = PAIR_FEATURES + DERIVED_FEATURES
+
+
+def _s1_name_freq(data_dir, cache):
+    """For each S1 row of the cache: how many S1 entities of that country share its core name."""
+    split = cache["meta"]["split"]
+    s1 = read_source(os.path.join(data_dir, split, f"{split}_source1.tsv"), cache["country"])
+    keys = [" ".join(sorted(name_core(n))) for n in s1["business_name"].to_list()]
+    counts = {}
+    for k in keys:
+        counts[k] = counts.get(k, 0) + 1
+    by_id = dict(zip(s1["entity_id"].to_list(), (counts[k] for k in keys)))
+    return np.array([by_id.get(e, 1) for e in cache["s1_ids"].to_list()], dtype=np.float32)
+
+
+def with_derived(cache, idx_rows, F_rows):
+    """(n, K, len(PAIR_FEATURES)) float32 -> (n, K, len(MODEL_FEATURES))."""
+    valid = idx_rows >= 0
+    freq = np.where(valid, cache["s1_freq"][np.maximum(idx_rows, 0)], 0).astype(np.float32)
+    dupes = ((F_rows[:, :, COL["name_skel_tset"]] >= 95) & valid).sum(axis=1, keepdims=True)
+    dupes = np.broadcast_to(dupes, idx_rows.shape).astype(np.float32)
+    return np.concatenate([F_rows, freq[..., None], dupes[..., None]], axis=2)
+
+
+def load_cache(cache_dir, split, country, data_dir):
     p = _cache_path(cache_dir, split, country)
     with open(os.path.join(p, "meta.json")) as fh:
         meta = json.load(fh)
@@ -650,13 +679,15 @@ def load_cache(cache_dir, split, country):
                          f"({len(meta.get('features', []))} vs {len(PAIR_FEATURES)} features). "
                          f"Use a new --out-dir (or delete that cache) and run --stage extract again.")
     recs = pl.read_parquet(os.path.join(p, "records.parquet"))
-    return {
+    cache = {
         "dir": p, "meta": meta, "country": country,
         "rec_ids": recs["rec_id"], "is_s2": (recs["src"] == "S2").to_numpy(),
         "s1_ids": pl.read_parquet(os.path.join(p, "s1.parquet"))["entity_id"],
         "idx": np.load(os.path.join(p, "idx.npy"), mmap_mode="r"),
         "F": np.load(os.path.join(p, "F.npy"), mmap_mode="r"),
     }
+    cache["s1_freq"] = _s1_name_freq(data_dir, cache)
+    return cache
 
 
 def load_owners(data_dir):
@@ -685,11 +716,12 @@ def predict_probs(booster, cache, rows_mask=None, n_threads=0):
     out = np.zeros((n, TOP_K), dtype=np.float32)
     for s in tqdm(range(0, n, PREDICT_CHUNK), desc=f"predict {cache['country']}", mininterval=10):
         e = min(n, s + PREDICT_CHUNK)
-        v = np.asarray(idx_mm[s:e]) >= 0
+        ix = np.asarray(idx_mm[s:e])
+        v = ix >= 0
         if rows_mask is not None:
             v &= rows_mask[s:e, None]
         if v.any():
-            F = np.asarray(F_mm[s:e], dtype=np.float32)
+            F = with_derived(cache, ix, np.asarray(F_mm[s:e], dtype=np.float32))
             out[s:e][v] = booster.predict(F[v], num_threads=n_threads)
     return out
 
@@ -833,7 +865,7 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
     rng = np.random.default_rng(SEED)
     parts, worlds = [], []
     for country in list_caches(cache_dir, "train"):
-        c = load_cache(cache_dir, "train", country)
+        c = load_cache(cache_dir, "train", country, data_dir)
         owner = owner_rows(c, owners)
         n, n_s1, full = len(owner), c["meta"]["n_s1"], not c["meta"]["sampled"]
         # fold by S1 ENTITY: every record of an entity lands in the same fold, so the model that
@@ -844,7 +876,8 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
         idx_s = np.asarray(c["idx"][sel])
         valid = idx_s >= 0
         y = (idx_s == owner[sel][:, None]) & valid
-        parts.append({"X": np.asarray(c["F"][sel], dtype=np.float32)[valid], "y": y[valid].astype(np.int8),
+        parts.append({"X": with_derived(c, idx_s, np.asarray(c["F"][sel], dtype=np.float32))[valid],
+                      "y": y[valid].astype(np.int8),
                       "fold": np.broadcast_to(rec_fold[sel][:, None], valid.shape)[valid], "full": full})
         idx_all = np.asarray(c["idx"])
         has = owner >= 0
@@ -911,7 +944,7 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
     train_dir = os.path.join(data_dir, "train")
     rng = np.random.default_rng(SEED)
     for country in list_caches(cache_dir, "train"):
-        c = load_cache(cache_dir, "train", country)
+        c = load_cache(cache_dir, "train", country, data_dir)
         pp = os.path.join(c["dir"], "probs_oof.npy")
         if c["meta"]["sampled"] or not os.path.exists(pp):
             continue
@@ -1017,7 +1050,7 @@ def predict_stage(data_dir, cache_dir, out_dir, n_threads, overrides):
 
     match_parts, cand_parts = [], []
     for country in list_caches(cache_dir, "test"):
-        c = load_cache(cache_dir, "test", country)
+        c = load_cache(cache_dir, "test", country, data_dir)
         probs_path = os.path.join(c["dir"], "probs_v2.npy")
         if os.path.exists(probs_path) and os.path.getmtime(probs_path) > os.path.getmtime(model_path):
             probs = np.load(probs_path)
