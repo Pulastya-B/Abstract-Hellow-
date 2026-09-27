@@ -10,7 +10,9 @@ DATA="${DATA:?set DATA to the folder that contains train/ and test/}"
 OUT="${OUT:?set OUT to a NEW output folder (caches from older code versions are not compatible)}"
 JOBS="${JOBS:-32}"
 MAX_DF="${MAX_DF:-0.05}"
-US_SAMPLE="${US_SAMPLE:-600000}"
+US_SAMPLE="${US_SAMPLE:-1000000}"
+FIT_SAMPLE="${FIT_SAMPLE:-1500000}"      # records per train cache for the pair model; lower it if fit runs out of RAM
+DECOY_WEIGHT="${DECOY_WEIGHT:-0}"        # 0 = derive from train/test record counts (~2)
 mkdir -p "$OUT"
 LOG="$OUT/pipeline.log"
 FM=(python "$HERE/src/fast_match.py" --data-dir "$DATA" --out-dir "$OUT" --n-jobs "$JOBS")
@@ -24,7 +26,7 @@ run() {
 run --stage extract --split train --countries India --max-df "$MAX_DF"
 run --stage extract --split train --countries US --sample "$US_SAMPLE" --max-df "$MAX_DF"
 run --stage extract --split test --max-df "$MAX_DF"
-run --stage fit
+run --stage fit --fit-sample "$FIT_SAMPLE" --decoy-weight "$DECOY_WEIGHT"
 run --stage analyze
 run --stage predict
 python "$HERE/../../utils/validate_submission.py" -m "$OUT/matching_results.tsv" \

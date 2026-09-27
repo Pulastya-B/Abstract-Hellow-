@@ -4,11 +4,13 @@ Retrieval-first matcher.
 Every S2/S3 record belongs to at most one S1 entity (0 violations across all
 7,638,365 train ground-truth pairs). So instead of blocking pairs from the S1
 side, each S2/S3 record is used as a query against a per-country word BM25
-index over S1 "name + address". Its top-10 S1 hits are each scored by a
-LightGBM pair model, and the record is assigned to its highest-probability
-candidate if that probability clears a threshold tuned for F0.5; otherwise it
-is assigned to nobody. S1 entities that no record claims come out empty,
-which is exactly the right answer for singletons.
+index over S1 "name + address", plus exact name/address-key matches. Its
+top-15 S1 hits are each scored by a LightGBM pair model; a second, record-level
+model reads the spread of those probabilities and decides whether the best
+pick is safe, against thresholds tuned for F0.5 in a train world whose sibling
+decoys are weighted to test's density. Unaccepted records are assigned to
+nobody. S1 entities that no record claims come out empty, which is exactly the
+right answer for singletons.
 
 Measured on train (3,000 true records per country, full S1 index): the true
 S1 is ranked #1 by BM25 for 91.4% (India) / 95.4% (US) of records and is in
@@ -51,18 +53,22 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 from rapidfuzz.utils import default_process
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
-from textnorm import (address_parts, core_compare, core_extras, has_repeated_word, house_match, name_core,
-                      noise_evidence, skeleton)
+from textnorm import (address_parts, core_compare, core_extras, expand_abbrev, has_repeated_word, house_match,
+                      is_subsequence, legal_form, name_core, noise_evidence, number_compare, numbers, skeleton,
+                      strip_latin_accents)
 
 TOKEN_PATTERN = r"(?u)\b\w+\b"
 MAX_DF = 0.05           # drop tokens in >5% of a country's S1 docs ("road", state codes, "pvt")
 BM25_K1 = 1.2
 BM25_B = 0.75
-TOP_K = 10              # S1 candidates retrieved and scored per record
+TOP_K = 15              # S1 candidates retrieved and scored per record
+MAX_INJECT = 4          # extra candidates from exact name/address keys that BM25's top-K missed
+INJECT_CAP = 3          # a key shared by more S1 entities than this is too ambiguous to inject
 CANDIDATE_OUT_K = 5     # candidates per record written to candidate_pairs.tsv (plus the assigned one);
                         # all 10 would be ~100M ids at full test scale, heavy for the validator/scorer
 TASK_CHUNK = 2000       # records per worker task
@@ -84,6 +90,9 @@ PAIR_FEATURES = [
     "num_common", "q_domain",
     # v5: learned noise vocabulary (--stage vocab): are the unmatched words ones the noise adds/drops?
     "extra_q_noise_min", "extra_q_distinct", "extra_s_drop_min", "extra_s_distinct", "q_dup_word",
+    # v6: sibling decoys (numbers changed vs digits dropped, legal form), exact-key agreement
+    "num_changed_q", "num_changed_s", "num_presence", "house_dig_lev", "house_dig_subseq",
+    "legal_same", "legal_trans", "exact_name", "exact_glued", "exact_addr",
 ]
 VOCAB_FILE = "noise_vocab.json"
 COL = {f: i for i, f in enumerate(PAIR_FEATURES)}
@@ -114,12 +123,84 @@ def list_countries(path):
     )
 
 
+def _country_of(df):
+    return df["country"][0] if df.height else ""
+
+
+def prep_name(s):
+    return default_process(strip_latin_accents(s))
+
+
+def prep_addr(s, country):
+    return default_process(expand_abbrev(strip_latin_accents(s).lower(), country))
+
+
+def bm25_preprocess(s):
+    return strip_latin_accents(s).lower()
+
+
 def doc_text(df):
     # The name's consonant skeleton is appended so Indian-script names can be retrieved via their
     # transliteration. Measured on 6,000 India records vs the full S1 index: Indian-script
     # recall@10 88.6% -> 95.9%, recall@1 78.3% -> 91.2%; Latin unchanged (97.2% -> 97.3%).
-    return [f"{n} {a} {skeleton(n)}"
+    country = _country_of(df)
+    return [f"{n} {expand_abbrev(bm25_preprocess(a), country)} {skeleton(n)}"
             for n, a in zip(df["business_name"].to_list(), df["business_address"].to_list())]
+
+
+# ── exact keys: a second retrieval channel next to BM25 ─────────────────────
+#
+# BM25 drops words in >5% of S1 docs, so "Apex Tech Pvt-Ltd" (no address) scores the same against every
+# "Apex Tech ..." and its exact twin can fall outside the top-K; a made-up trade name ("Tavowexlyra") with
+# the owner's exact address competes with every business on that street. These keys catch both.
+
+def name_keys(name):
+    """-> (sorted core tokens + legal form, core tokens glued together: 'creativeglobal.com' = 'Creative Global')."""
+    core = name_core(name)
+    glued = "".join(core)
+    return (" ".join(sorted(core)) + "|" + legal_form(name) if core else "", glued if len(glued) >= 6 else "")
+
+
+def addr_key(prepped):
+    """Sorted tokens of a prepped address; only addresses with a number are specific enough."""
+    toks = prepped.split()
+    return " ".join(sorted(toks)) if len(toks) >= 3 and any(c.isdigit() for c in prepped) else ""
+
+
+def _keys_chunk(args):
+    names, addrs, country = args
+    return [(*name_keys(n), addr_key(prep_addr(a, country))) for n, a in zip(names, addrs)]
+
+
+def _all_keys(df, country, n_jobs):
+    names, addrs = df["business_name"].to_list(), df["business_address"].to_list()
+    step = 20_000
+    tasks = [(names[s:s + step], addrs[s:s + step], country) for s in range(0, len(names), step)]
+    if n_jobs <= 1 or len(tasks) == 1:
+        return [k for t in tasks for k in _keys_chunk(t)]
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context("spawn")) as ex:
+        return [k for part in ex.map(_keys_chunk, tasks) for k in part]
+
+
+def injections(s1, q, n_jobs=1):
+    """(records, MAX_INJECT) S1 rows sharing an exact key with each record (-1 = none)."""
+    country = _country_of(s1)
+    maps = ({}, {}, {})
+    for j, keys in enumerate(_all_keys(s1, country, n_jobs)):
+        for m, k in zip(maps, keys):
+            if k:
+                m.setdefault(k, []).append(j)
+    maps = tuple({k: v for k, v in m.items() if len(v) <= INJECT_CAP} for m in maps)
+    out = np.full((q.height, MAX_INJECT), -1, dtype=np.int32)
+    for i, keys in enumerate(_all_keys(q, country, n_jobs)):
+        got = []
+        for m, k in zip(maps, keys):
+            for j in m.get(k, ()) if k else ():
+                if j not in got:
+                    got.append(j)
+        if got:
+            out[i, :min(len(got), MAX_INJECT)] = got[:MAX_INJECT]
+    return out
 
 
 def write_lists(all_s1_ids, pairs, path, col):
@@ -167,10 +248,12 @@ def _init_worker(XT, s1_names, s1_addrs, model_path, country="", vocab=None):
     _W["XT"] = XT
     _W["country"] = country
     _W["vocab"] = vocab or {}
-    _W["sn"] = [default_process(x) for x in s1_names]
-    _W["sa"] = [default_process(x) for x in s1_addrs]
+    _W["sn"] = [prep_name(x) for x in s1_names]
+    _W["sa"] = [prep_addr(x, country) for x in s1_addrs]
     _W["s_nonlatin"] = np.array([_nonlatin(x) for x in s1_names], dtype=np.float32)
     _W["s_digits"] = [_digit_info(x) for x in s1_addrs]
+    _W["s_nums"] = [numbers(x) for x in s1_addrs]
+    _W["s_legal"] = [legal_form(x) for x in s1_names]
     _W["s_skel"] = [skeleton(x) for x in s1_names]
     _W["s_addr"] = [_addr_info(x, country) for x in s1_addrs]
     _W["s_core"] = [name_core(x) for x in s1_names]
@@ -184,7 +267,8 @@ def _init_worker(XT, s1_names, s1_addrs, model_path, country="", vocab=None):
     _W["booster"] = lgb.Booster(model_file=model_path) if model_path else None
 
 
-def _topk(Q):
+def _topk(Q, inj=None):
+    """BM25 top-K per record; exact-key candidates (inj) BM25 missed replace its lowest-ranked ones."""
     n = Q.shape[0]
     idx = np.full((n, TOP_K), -1, dtype=np.int64)
     sc = np.zeros((n, TOP_K), dtype=np.float32)
@@ -192,13 +276,24 @@ def _topk(Q):
         R = (Q[s:s + SUB_CHUNK] @ _W["XT"]).tocsr()
         for i in range(R.shape[0]):
             lo, hi = R.indptr[i], R.indptr[i + 1]
-            if lo == hi:
-                continue
-            d, c = R.data[lo:hi], R.indices[lo:hi]
+            d_all, c_all = R.data[lo:hi], R.indices[lo:hi]
+            d, c = d_all, c_all
             if len(d) > TOP_K:
                 sel = np.argpartition(-d, TOP_K)[:TOP_K]
                 d, c = d[sel], c[sel]
-            order = np.argsort(-d)
+            if inj is not None:
+                extra = [j for j in inj[s + i] if j >= 0 and j not in c]
+                if extra:
+                    keep = TOP_K - len(extra)
+                    if len(d) > keep:
+                        o = np.argsort(-d)[:keep]
+                        d, c = d[o], c[o]
+                    es = [float(d_all[c_all == j][0]) if (c_all == j).any() else 0.0 for j in extra]
+                    d = np.concatenate([d, np.array(es, dtype=d.dtype)])
+                    c = np.concatenate([c, np.array(extra, dtype=c.dtype)])
+            if not len(d):
+                continue
+            order = np.argsort(-d, kind="stable")
             k = len(order)
             idx[s + i, :k] = c[order]
             sc[s + i, :k] = d[order]
@@ -227,14 +322,22 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
     sn, sa, s_nonlatin, s_digits = _W["sn"], _W["sa"], _W["s_nonlatin"], _W["s_digits"]
     s_skel, s_addr, country = _W["s_skel"], _W["s_addr"], _W["country"]
     s_core, idf, idf_unseen, vocab = _W["s_core"], _W["idf"], _W["idf_unseen"], _W["vocab"]
+    s_nums, s_legal = _W["s_nums"], _W["s_legal"]
+    legal_rates = vocab.get("legal", {})
     for i in range(n):
-        a_name = default_process(q_names[i])
-        a_addr = default_process(q_addrs[i])
+        a_name = prep_name(q_names[i])
+        a_addr = prep_addr(q_addrs[i], country)
         a_empty = not a_addr
         a_digits, a_first = _digit_info(q_addrs[i])
         a_skel = skeleton(q_names[i])
         a_house, a_segs, a_state, a_postal, a_addr_skel = _addr_info(q_addrs[i], country)
         a_core = name_core(q_names[i])
+        a_nums = numbers(q_addrs[i])
+        a_legal = legal_form(q_names[i])
+        a_core_key = sorted(a_core)
+        a_glued = "".join(a_core)
+        a_akey = addr_key(a_addr)
+        a_hdig = re.sub(r"\D", "", a_house)
         low = q_names[i].lower()
         F[i, :, COL["q_addr_empty"]] = float(a_empty)
         F[i, :, COL["q_nonlatin"]] = _nonlatin(q_names[i])
@@ -281,6 +384,28 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
             la, lb = len(a_name), len(b_name)
             row[COL["name_len_ratio"]] = min(la, lb) / max(la, lb) if max(la, lb) else 0
 
+            (row[COL["num_changed_q"]], row[COL["num_changed_s"]],
+             row[COL["num_presence"]]) = number_compare(a_nums, s_nums[j])
+            b_hdig = re.sub(r"\D", "", b_house)
+            if a_hdig and b_hdig:
+                row[COL["house_dig_lev"]] = Levenshtein.distance(a_hdig, b_hdig)
+                short, long_ = sorted((a_hdig, b_hdig), key=len)
+                row[COL["house_dig_subseq"]] = float(is_subsequence(short, long_))
+            else:
+                row[COL["house_dig_lev"]] = -1
+                row[COL["house_dig_subseq"]] = -1
+            b_legal = s_legal[j]
+            if a_legal and b_legal:
+                row[COL["legal_same"]] = float(a_legal == b_legal)
+                row[COL["legal_trans"]] = legal_rates.get(f"{b_legal}>{a_legal}", -1.0)
+            else:
+                row[COL["legal_same"]] = -1
+                row[COL["legal_trans"]] = -1
+            b_core = s_core[j]
+            row[COL["exact_name"]] = float(bool(a_core) and a_core_key == sorted(b_core) and a_legal == b_legal)
+            row[COL["exact_glued"]] = float(len(a_glued) >= 6 and a_glued == "".join(b_core))
+            row[COL["exact_addr"]] = float(bool(a_akey) and a_akey == addr_key(b_addr))
+
     # competition: how far each candidate is from the record's best candidate on each signal
     for f, gap in (("name_tset", "name_tset_gap_to_best"), ("addr_tset", "addr_tset_gap_to_best"),
                    ("name_skel_tset", "name_skel_gap_to_best"), ("addr_skel_tset", "addr_skel_gap_to_best")):
@@ -294,8 +419,8 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
 
 
 def _process_chunk(task):
-    Q, q_names, q_addrs, q_is_s2 = task
-    idx, sc = _topk(Q)
+    Q, q_names, q_addrs, q_is_s2, inj = task
+    idx, sc = _topk(Q, inj)
     F = _pair_features(q_names, q_addrs, q_is_s2, idx, sc)
     booster = _W["booster"]
     if booster is None:
@@ -306,12 +431,13 @@ def _process_chunk(task):
     return idx, sc, probs.astype(np.float32)
 
 
-def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc, vocab=None):
+def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc, vocab=None, inj=None):
     """Yields (start_row, result) in row order; result is (idx, sc, F) or (idx, sc, probs)."""
     qn, qa = q["business_name"].to_list(), q["business_address"].to_list()
     qs2 = (q["src"] == "S2").to_numpy().astype(np.float32)
     starts = list(range(0, q.height, TASK_CHUNK))
-    tasks = [(Q[s:s + TASK_CHUNK], qn[s:s + TASK_CHUNK], qa[s:s + TASK_CHUNK], qs2[s:s + TASK_CHUNK]) for s in starts]
+    tasks = [(Q[s:s + TASK_CHUNK], qn[s:s + TASK_CHUNK], qa[s:s + TASK_CHUNK], qs2[s:s + TASK_CHUNK],
+              None if inj is None else inj[s:s + TASK_CHUNK]) for s in starts]
     country = s1["country"][0] if s1.height else ""
     initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path, country, vocab)
     if n_jobs <= 1:
@@ -343,7 +469,8 @@ def build_index(s1, max_df=None):
     recall@1 India 89.0% -> 91.4%, US 94.9% -> 95.4%; recall@10 India 94.2% -> 95.7%,
     US 97.8% -> 98.2%; same speed.
     """
-    vec = CountVectorizer(token_pattern=TOKEN_PATTERN, max_df=max_df or MAX_DF, dtype=np.float32)
+    vec = CountVectorizer(token_pattern=TOKEN_PATTERN, max_df=max_df or MAX_DF, dtype=np.float32,
+                          preprocessor=bm25_preprocess)
     tf = vec.fit_transform(doc_text(s1)).tocsr()
     n = tf.shape[0]
     df = np.bincount(tf.indices, minlength=tf.shape[1]).astype(np.float32)
@@ -577,8 +704,12 @@ def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df,
         F_mm = np.lib.format.open_memmap(os.path.join(out, "F.npy"), mode="w+", dtype=np.float16,
                                          shape=(n, TOP_K, len(PAIR_FEATURES)))
         Q = encode_queries(vec, q)
+        t1 = time.time()
+        inj = injections(s1, q, n_jobs)
+        log(f"[extract {split} {country}] exact-key candidates for {(inj[:, 0] >= 0).mean():.1%} of records "
+            f"({time.time() - t1:.0f}s)")
         for s, (idx, _, F) in iter_chunks(Q, q, XT, s1, n_jobs, None, desc=f"extract {split} {country}",
-                                          vocab=vocab):
+                                          vocab=vocab, inj=inj):
             idx_mm[s:s + len(idx)] = idx
             F_mm[s:s + len(idx)] = F
         idx_mm.flush()
@@ -617,7 +748,7 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
              .join(s1.rename({"business_name": "sn"}), on="owner"))
     log(f"[vocab] learning noise vocabulary from {pairs.height:,} train true pairs")
 
-    added, dropped, rec_tok, s1_tok = {}, {}, {}, {}
+    added, dropped, rec_tok, s1_tok, legal_pair, legal_s1 = {}, {}, {}, {}, {}, {}
 
     def bump(d, toks):
         for t in toks:
@@ -631,14 +762,23 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
             _, xq, xs = core_extras(q, s, fuzz.ratio)
             bump(added, xq)
             bump(dropped, xs)
+        lq, ls = legal_form(rn), legal_form(sn)
+        if lq and ls:
+            bump(legal_pair, [f"{ls}>{lq}"])
+            bump(legal_s1, [ls])
     vocab = {"added": {t: added.get(t, 0) / c for t, c in rec_tok.items() if c >= min_count},
-             "dropped": {t: dropped.get(t, 0) / c for t, c in s1_tok.items() if c >= min_count}}
+             "dropped": {t: dropped.get(t, 0) / c for t, c in s1_tok.items() if c >= min_count},
+             # P(record's legal form | S1's legal form) on true pairs: "pvt>ltd" is common noise, "ltd>llp" is not
+             "legal": {k: c / legal_s1[k.split(">")[0]] for k, c in legal_pair.items()
+                       if legal_s1[k.split(">")[0]] >= min_count}}
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, VOCAB_FILE), "w") as fh:
         json.dump(vocab, fh)
     top = sorted(((r, t) for t, r in vocab["added"].items() if rec_tok[t] >= 200), reverse=True)[:15]
     log(f"[vocab] {len(vocab['added']):,} record words / {len(vocab['dropped']):,} S1 words kept; most often "
         f"added by noise: {', '.join(f'{t} {r:.0%}' for r, t in top)}")
+    keep = sorted(((k, r) for k, r in vocab["legal"].items() if k.split(">")[0] == k.split(">")[1]), key=lambda x: -x[1])
+    log(f"[vocab] legal form kept by the noise: {', '.join(f'{k.split(chr(62))[0]} {r:.0%}' for k, r in keep)}")
 
 
 # Features computed when a cache is LOADED (not stored in it), so they can be added without re-extracting.
@@ -726,7 +866,7 @@ def predict_probs(booster, cache, rows_mask=None, n_threads=0):
     return out
 
 
-def assign(idx, probs, is_s2, n_s1, t_high, t_sib, t_first, sib_other_source):
+def assign(idx, probs, is_s2, n_s1, t_high, t_sib, t_first, sib_other_source, score=None):
     """
     Entity-aware assignment. Each record can only go to its highest-probability candidate:
       A. p >= t_high
@@ -735,13 +875,16 @@ def assign(idx, probs, is_s2, n_s1, t_high, t_sib, t_first, sib_other_source):
       C. p >= t_first, for S1 entities still empty after A+B: their single most likely record
     Why: per entity F0.5 = 1.25k / (k + f + 0.25n), so an entity's first correct link is worth
     far more than its 4th, and a wrong link on an empty non-singleton costs nothing, which a
-    single global threshold cannot express. Returns (S1 row per record or -1, stage 0/1/2/3).
+    single global threshold cannot express. p is `score` when given (the record-level model's
+    confidence that the pick is right), else the pick's pair probability.
+    Returns (S1 row per record or -1, stage 0/1/2/3).
     """
     rows = np.arange(len(idx))
     b = probs.argmax(axis=1)
-    p = probs[rows, b]
+    p_pair = probs[rows, b]
+    p = p_pair if score is None else score
     e = np.asarray(idx[rows, b], dtype=np.int64)
-    valid = (e >= 0) & (p > 0)
+    valid = (e >= 0) & (p_pair > 0)
     ec = np.where(valid, e, 0)
     stage = np.zeros(len(idx), dtype=np.int8)
     stage[valid & (p >= t_high)] = 1
@@ -764,40 +907,49 @@ def assign(idx, probs, is_s2, n_s1, t_high, t_sib, t_first, sib_other_source):
     return np.where(stage > 0, e, -1), stage
 
 
-def entity_f05(assigned_e, owner, n_true):
-    """Exact per-S1 leaderboard F0.5 (singletons: 1 if left empty, else 0)."""
+def entity_f05(assigned_e, owner, n_true, w_unowned=1.0):
+    """
+    Exact per-S1 leaderboard F0.5 (singletons: 1 if left empty, else 0), with false links made by
+    UNOWNED records counted w_unowned times.
+
+    Why: unowned records are generated sibling businesses (same street as a real S1, number changed), and
+    test has ~2x as many of them per S1 as train (address-key mixture analysis: test unowned records hit an
+    S1's street at the same rate as train's, i.e. they are all sibling-type, at 2.44 vs 1.22 per S1). So a
+    false link seen in train stands for ~w of them in test. Singletons score 0/1, so there the expectation is
+    kept at the group level: a singleton hit only by unowned records scores 1 - w (can be < 0; means only).
+    """
     n = len(n_true)
     a = assigned_e >= 0
     correct = a & (assigned_e == owner)
     k = np.bincount(assigned_e[correct], minlength=n)
-    f = np.bincount(assigned_e[a & ~correct], minlength=n)
-    return np.where(n_true == 0, (f == 0).astype(np.float64), 1.25 * k / np.maximum(k + f + 0.25 * n_true, 1e-9))
+    fo = np.bincount(assigned_e[a & ~correct & (owner >= 0)], minlength=n)
+    fu = np.bincount(assigned_e[a & (owner < 0)], minlength=n)
+    single = np.where(fo > 0, 0.0, 1.0 - w_unowned * (fu > 0))
+    return np.where(n_true == 0, single, 1.25 * k / np.maximum(k + fo + w_unowned * fu + 0.25 * n_true, 1e-9))
 
 
-def shift_world(w, drop_frac, seed=SEED):
-    """
-    Make a train world look like test: test has 5.75 S2/S3 records per S1 vs 4.68 in train, so
-    at equal matches per S1 (~3.46) ~40% of test records have no owner vs ~26% in train. Removing
-    `drop_frac` of S1 entities from the index while KEEPING their records turns those records into
-    unowned noise that looks exactly like real businesses, the same way test's unowned records do
-    (their S1 entry simply isn't there). drop_frac = 1 - 0.602/0.74 ~= 0.19.
-    """
-    n_s1 = len(w["n_true"])
-    dropped = np.random.default_rng(seed).random(n_s1) < drop_frac
-    idx = w["idx"]
-    gone = (idx >= 0) & dropped[np.maximum(idx, 0)]
-    owner = np.where((w["owner"] >= 0) & dropped[np.maximum(w["owner"], 0)], -1, w["owner"])
-    return dict(w, probs=np.where(gone, 0.0, w["probs"]).astype(np.float32), owner=owner,
-                n_true=np.bincount(owner[owner >= 0], minlength=n_s1), mask=~dropped)
+def decoy_weight(cache_dir, world):
+    """Test unowned records per S1 / train unowned records per S1, assuming test has train's owned records per
+    S1 (3.46 India; the address-key mixture analysis on test India gave 3.42)."""
+    has = world["owner"] >= 0
+    n_s1 = len(world["n_true"])
+    owned, unowned = has.sum() / n_s1, max((~has).sum() / n_s1, 1e-9)
+    metas = {}
+    for c in list_caches(cache_dir, "test"):
+        with open(os.path.join(_cache_path(cache_dir, "test", c), "meta.json")) as fh:
+            metas[c] = json.load(fh)
+    if not metas:
+        return 2.0, None, owned, unowned
+    use = [metas[world["cache"]["country"]]] if world["cache"]["country"] in metas else list(metas.values())
+    rps = sum(m["n_records"] for m in use) / sum(m["n_s1"] for m in use)
+    return float(np.clip((rps - owned) / unowned, 1.0, 4.0)), rps, owned, unowned
 
 
 def _evaluate(worlds, params):
     tot = cnt = 0
     for w in worlds:
-        e, _ = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params)
-        F = entity_f05(e, w["owner"], w["n_true"])
-        if w.get("mask") is not None:
-            F = F[w["mask"]]
+        e, _ = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params, score=w.get("score"))
+        F = entity_f05(e, w["owner"], w["n_true"], w["w"])
         tot += F.sum()
         cnt += len(F)
     return tot / cnt
@@ -805,25 +957,22 @@ def _evaluate(worlds, params):
 
 def _report(worlds, params, label):
     for w in worlds:
-        e, stage = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params)
-        F = entity_f05(e, w["owner"], w["n_true"])
+        e, stage = assign(w["idx"], w["probs"], w["cache"]["is_s2"], len(w["n_true"]), **params, score=w.get("score"))
+        F = entity_f05(e, w["owner"], w["n_true"], w["w"])
         sing = w["n_true"] == 0
-        if w.get("mask") is not None:
-            F, sing = F[w["mask"]], sing[w["mask"]]
-        log(f"[{label} {w['cache']['country']}] leaderboard-style F0.5={F.mean():.4f} | singletons "
-            f"{F[sing].mean():.3f} (n={sing.sum():,}) | non-singletons {F[~sing].mean():.3f}, of which "
-            f"{(F[~sing] == 0).mean():.1%} score 0 | links by stage A/B/C: "
+        log(f"[{label} {w['cache']['country']}] leaderboard-style F0.5={F.mean():.4f} (decoys x{w['w']:.2f}) | "
+            f"singletons {F[sing].mean():.3f} (n={sing.sum():,}) | non-singletons {F[~sing].mean():.3f}, of which "
+            f"{(F[~sing] <= 0).mean():.1%} score 0 | links by stage A/B/C: "
             f"{(stage == 1).sum():,}/{(stage == 2).sum():,}/{(stage == 3).sum():,}")
 
 
-def tune(worlds):
+def tune(worlds, label):
     def single(t):
         return {"t_high": float(t), "t_sib": float(t), "t_first": float(t), "sib_other_source": False}
 
-    base = {float(t): _evaluate(worlds, single(t)) for t in np.round(np.arange(0.30, 0.951, 0.025), 3)}
+    base = {float(t): _evaluate(worlds, single(t)) for t in np.round(np.arange(0.30, 0.991, 0.025), 3)}
     t_base = max(base, key=base.get)
-    log(f"[tune] one global threshold (the submitted method): best t={t_base:.3f} -> F0.5 {base[t_base]:.4f}")
-    _report(worlds, single(t_base), "tune single-threshold")
+    log(f"[tune {label}] one global threshold: best t={t_base:.3f} -> F0.5 {base[t_base]:.4f}")
 
     best, best_score = single(t_base), base[t_base]
 
@@ -839,28 +988,78 @@ def tune(worlds):
                 consider(dict(best, t_sib=float(ts), sib_other_source=other))
         for tf in np.round(np.arange(0.05, best["t_high"], 0.05), 3):
             consider(dict(best, t_first=float(tf)))
-        for th in np.round(np.arange(max(0.30, best["t_high"] - 0.15), min(0.976, best["t_high"] + 0.151), 0.025), 3):
+        for th in np.round(np.arange(max(0.30, best["t_high"] - 0.15), min(0.991, best["t_high"] + 0.151), 0.025), 3):
             consider(dict(best, t_high=float(th), t_sib=min(best["t_sib"], float(th)),
                           t_first=min(best["t_first"], float(th))))
-        log(f"[tune] round {rnd + 1}: {best} -> F0.5 {best_score:.4f}")
-    _report(worlds, best, "tune entity-aware")
+        log(f"[tune {label}] round {rnd + 1}: {best} -> F0.5 {best_score:.4f}")
+    _report(worlds, best, f"tune {label}")
     return best, best_score, base[t_base], t_base
 
 
-def _fit_lgb(parts, mask_fn, n_threads):
-    X = np.concatenate([p["X"][mask_fn(p)] for p in parts])
-    y = np.concatenate([p["y"][mask_fn(p)] for p in parts])
-    log(f"[fit] LightGBM on {len(y):,} (record, candidate) rows ({int(y.sum()):,} positive)")
-    m = lgb.LGBMClassifier(
-        n_estimators=1000, learning_rate=0.05, num_leaves=127, min_child_samples=100,
-        subsample=0.8, subsample_freq=1, colsample_bytree=0.9,
-        random_state=SEED, n_jobs=n_threads if n_threads > 0 else -1, verbose=-1,
-    )
+def _fit_lgb(X, y, n_threads, label, **overrides):
+    log(f"[fit] LightGBM ({label}) on {len(y):,} rows ({int(y.sum()):,} positive, {X.shape[1]} features)")
+    kw = dict(n_estimators=1000, learning_rate=0.05, num_leaves=127, min_child_samples=100,
+              subsample=0.8, subsample_freq=1, colsample_bytree=0.9,
+              random_state=SEED, n_jobs=n_threads if n_threads > 0 else -1, verbose=-1)
+    kw.update(overrides)
+    m = lgb.LGBMClassifier(**kw)
     m.fit(X, y)
     return m.booster_
 
 
-def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
+def _fit_pairs(parts, mask_fn, n_threads, label):
+    X = np.concatenate([p["X"][mask_fn(p)] for p in parts])
+    y = np.concatenate([p["y"][mask_fn(p)] for p in parts])
+    return _fit_lgb(X, y, n_threads, label)
+
+
+REC_MODEL = "fast_recmodel_v2.txt"
+REC_BASE = ["p1", "p2", "p3", "p_gap12", "p_sum", "n_p50", "pick_rank", "n_valid"]
+REC_FEATURES = REC_BASE + [f"best_{f}" for f in MODEL_FEATURES] + [f"second_{f}" for f in MODEL_FEATURES]
+REC_PARAMS = dict(n_estimators=600, num_leaves=63, min_child_samples=200, colsample_bytree=0.8)
+
+
+def record_features(cache, probs):
+    """
+    One row per record for the record-level model: how the pair model's probability is spread over the
+    record's candidates, plus the full feature rows of its top-2 candidates. It learns when a confident pick
+    is still unsafe: two S1 entities at p=1.00 with the same name (the record has no address to decide),
+    a sibling whose street matches but whose number doesn't.
+    """
+    idx_mm, F_mm = cache["idx"], cache["F"]
+    n = len(probs)
+    out = np.zeros((n, len(REC_FEATURES)), dtype=np.float32)
+    nb = len(REC_BASE)
+    nf = len(MODEL_FEATURES)
+    for s in range(0, n, PREDICT_CHUNK):
+        e = min(n, s + PREDICT_CHUNK)
+        ix = np.asarray(idx_mm[s:e])
+        P = probs[s:e]
+        F = with_derived(cache, ix, np.asarray(F_mm[s:e], dtype=np.float32))
+        r = np.arange(e - s)
+        b = P.argmax(axis=1)
+        P2 = P.copy()
+        P2[r, b] = -1.0
+        b2 = P2.argmax(axis=1)
+        top = -np.sort(-P, axis=1)[:, :3]
+        o = out[s:e]
+        o[:, :nb] = np.column_stack([top[:, 0], top[:, 1], top[:, 2], top[:, 0] - top[:, 1], P.sum(axis=1),
+                                     (P > 0.5).sum(axis=1), b, (ix >= 0).sum(axis=1)])
+        o[:, nb:nb + nf] = F[r, b]
+        o[:, nb + nf:] = F[r, b2]
+    return out
+
+
+def record_scores(booster, cache, probs, n_threads=0):
+    out = np.zeros(len(probs), dtype=np.float32)
+    for s in range(0, len(probs), PREDICT_CHUNK):
+        e = min(len(probs), s + PREDICT_CHUNK)
+        sub = {**cache, "idx": cache["idx"][s:e], "F": cache["F"][s:e]}
+        out[s:e] = booster.predict(record_features(sub, probs[s:e]), num_threads=n_threads)
+    return out
+
+
+def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, decoy_w):
     owners = load_owners(data_dir)
     rng = np.random.default_rng(SEED)
     parts, worlds = [], []
@@ -876,57 +1075,95 @@ def fit_stage(data_dir, cache_dir, out_dir, fit_sample, n_threads, noise_shift):
         idx_s = np.asarray(c["idx"][sel])
         valid = idx_s >= 0
         y = (idx_s == owner[sel][:, None]) & valid
-        parts.append({"X": with_derived(c, idx_s, np.asarray(c["F"][sel], dtype=np.float32))[valid],
+        parts.append({"cache": c, "owner": owner, "rec_fold": rec_fold,
+                      "X": with_derived(c, idx_s, np.asarray(c["F"][sel], dtype=np.float32))[valid],
                       "y": y[valid].astype(np.int8),
-                      "fold": np.broadcast_to(rec_fold[sel][:, None], valid.shape)[valid], "full": full})
+                      "fold": np.broadcast_to(rec_fold[sel][:, None], valid.shape)[valid]})
         idx_all = np.asarray(c["idx"])
         has = owner >= 0
         in_top = (idx_all == owner[:, None]).any(axis=1)
         log(f"[fit {country}] {n:,} records ({'full world' if full else 'sample'}), {has.mean():.1%} have an owner, "
             f"owner in top-{TOP_K}: {in_top[has].mean():.1%}; fitting on {len(sel):,} of them")
         if full:
-            worlds.append({"cache": c, "idx": idx_all, "owner": owner, "rec_fold": rec_fold,
+            worlds.append({"cache": c, "idx": idx_all, "owner": owner, "part": len(parts) - 1,
                            "n_true": np.bincount(owner[has], minlength=n_s1)})
 
     os.makedirs(out_dir, exist_ok=True)
-    result = {"params": {"t_high": 0.78, "t_sib": 0.78, "t_first": 0.78, "sib_other_source": False}}
+    result = {"params": {"t_high": 0.78, "t_sib": 0.78, "t_first": 0.78, "sib_other_source": False},
+              "use_record_model": False}
     if worlds:
-        excl = []
-        for f in (0, 1):
-            log(f"[fit] evaluation model {f + 1}/2 (never sees fold-{f} entities)")
-            excl.append(_fit_lgb(parts, lambda p, f=f: (p["fold"] != f) if p["full"] else np.ones(len(p["y"]), bool),
-                                 n_threads))
-        for w in worlds:
-            w["probs"] = sum(predict_probs(excl[f], w["cache"], rows_mask=(w["rec_fold"] == f), n_threads=n_threads)
+        # 1. pair model, out-of-fold: every train record scored by the model that never saw its entity
+        excl = [_fit_pairs(parts, lambda p, f=f: p["fold"] != f, n_threads, f"pair, without fold {f}")
+                for f in (0, 1)]
+        for p in parts:
+            p["probs"] = sum(predict_probs(excl[f], p["cache"], rows_mask=(p["rec_fold"] == f), n_threads=n_threads)
                              for f in (0, 1))
-            log(f"[fit {w['cache']['country']}] train world: {(w['owner'] < 0).mean():.1%} of records unowned")
+            idx_all = np.asarray(p["cache"]["idx"])
+            rows = np.arange(len(idx_all))
+            pick = idx_all[rows, p["probs"].argmax(axis=1)]
+            p["R"] = record_features(p["cache"], p["probs"])
+            p["ry"] = ((pick == p["owner"]) & (pick >= 0)).astype(np.int8)
+            p["rvalid"] = p["probs"].max(axis=1) > 0
+        del excl
+
+        # 2. record-level model on those out-of-fold probabilities, itself out-of-fold for tuning
+        for p in parts:
+            p["rscore"] = np.zeros(len(p["ry"]), dtype=np.float32)
+        for f in (0, 1):
+            tr = [p["rvalid"] & (p["rec_fold"] != f) for p in parts]
+            m = _fit_lgb(np.concatenate([p["R"][t] for p, t in zip(parts, tr)]),
+                         np.concatenate([p["ry"][t] for p, t in zip(parts, tr)]), n_threads,
+                         f"record, without fold {f}", **REC_PARAMS)
+            for p in parts:
+                te = p["rvalid"] & (p["rec_fold"] == f)
+                p["rscore"][te] = m.predict(p["R"][te], num_threads=n_threads)
+        log("[fit] record model, final (all folds)")
+        allr = [p["rvalid"] for p in parts]
+        _fit_lgb(np.concatenate([p["R"][t] for p, t in zip(parts, allr)]),
+                 np.concatenate([p["ry"][t] for p, t in zip(parts, allr)]), n_threads, "record, final",
+                 **REC_PARAMS).save_model(os.path.join(out_dir, REC_MODEL))
+        for p in parts:
+            del p["R"]
+
+        # 3. tune the assignment rules on a test-like world: unowned (sibling) false links weighted up
+        for w in worlds:
+            p = parts[w["part"]]
+            w["probs"], w["score"] = p["probs"], p["rscore"]
             np.save(os.path.join(w["cache"]["dir"], "probs_oof.npy"), w["probs"])  # for --stage analyze
-        log("[tune] ── as-is train world (for reference only; test has far more unowned records) ──")
-        _, raw_score, raw_base, raw_t = tune(worlds)
-        result = {"raw_world": {"entity_aware_f05": raw_score, "single_threshold_f05": raw_base,
-                                "single_threshold": raw_t}}
-        if noise_shift > 0:
-            worlds = [shift_world(w, noise_shift) for w in worlds]
-            for w in worlds:
-                log(f"[fit {w['cache']['country']}] test-like world: {noise_shift:.0%} of S1 removed from the index, "
-                    f"{(w['owner'] < 0).mean():.1%} of records now unowned")
-            log("[tune] ── test-like world (these parameters are the ones saved and used) ──")
-        params, score, base_score, t_base = tune(worlds)
-        result.update({"params": params, "leaderboard_style_f05": score,
-                       "single_threshold_f05": base_score, "single_threshold": t_base, "noise_shift": noise_shift,
-                       "evaluated_on": [w["cache"]["country"] for w in worlds]})
-        log(f"[fit] leaderboard-style F0.5 on held-out entities ({'test-like' if noise_shift > 0 else 'as-is'} world): "
-            f"single threshold {base_score:.4f} -> entity-aware {score:.4f}; "
-            f"old fixed 0.78: {_evaluate(worlds, {'t_high': .78, 't_sib': .78, 't_first': .78, 'sib_other_source': False}):.4f}")
+            np.save(os.path.join(w["cache"]["dir"], "rec_oof.npy"), w["score"])
+            wt, rps, owned, unowned = decoy_weight(cache_dir, w)
+            w["w"] = decoy_w if decoy_w > 0 else wt
+            log(f"[fit {w['cache']['country']}] train: {owned:.2f} owned + {unowned:.2f} unowned records per S1; "
+                f"test: {rps if rps is None else round(rps, 2)} records per S1 -> unowned false links weighted "
+                f"x{w['w']:.2f}{' (--decoy-weight)' if decoy_w > 0 else ''}")
+        pair_worlds = [dict(w, score=None) for w in worlds]
+        p_params, p_score, p_base, p_t = tune(pair_worlds, "pair-prob")
+        r_params, r_score, r_base, r_t = tune(worlds, "record-model")
+        use_rec = r_score > p_score
+        params, score = (r_params, r_score) if use_rec else (p_params, p_score)
+        chosen = worlds if use_rec else pair_worlds
+        as_is = _evaluate([dict(w, w=1.0) for w in chosen], params)
+        old = _evaluate([dict(w, w=1.0, score=None) for w in worlds],
+                        {"t_high": .725, "t_sib": .7, "t_first": .725, "sib_other_source": False})
+        log(f"[fit] leaderboard-style F0.5 on held-out entities, test-like world (decoys weighted): pair prob "
+            f"{p_score:.4f} vs record model {r_score:.4f} -> using {'record model' if use_rec else 'pair prob'}")
+        log(f"[fit] same params on the as-is train world (comparable to v5's 0.9698): {as_is:.4f}; "
+            f"v5 rule (0.725 on pair prob) on this model, as-is world: {old:.4f}")
+        result = {"params": params, "use_record_model": bool(use_rec), "decoy_weight": [w["w"] for w in worlds],
+                  "leaderboard_style_f05": score, "as_is_world_f05": as_is,
+                  "pair_prob": {"f05": p_score, "params": p_params, "single_threshold": p_t, "single_f05": p_base},
+                  "record_model": {"f05": r_score, "params": r_params, "single_threshold": r_t, "single_f05": r_base},
+                  "evaluated_on": [w["cache"]["country"] for w in worlds]}
     else:
         log("[fit] WARNING: no full-world train cache (extract one with --split train and no --sample); "
             "cannot evaluate or tune, using the old single threshold 0.78")
 
-    log("[fit] final model on all sampled records")
-    _fit_lgb(parts, lambda p: np.ones(len(p["y"]), bool), n_threads).save_model(os.path.join(out_dir, V2_MODEL))
+    log("[fit] final pair model on all sampled records")
+    _fit_pairs(parts, lambda p: np.ones(len(p["y"]), bool), n_threads, "pair, final").save_model(
+        os.path.join(out_dir, V2_MODEL))
     with open(os.path.join(out_dir, V2_PARAMS), "w") as fh:
         json.dump(result, fh, indent=2)
-    log(f"[fit] saved {V2_MODEL} + {V2_PARAMS} to {out_dir}")
+    log(f"[fit] saved {V2_MODEL} + {REC_MODEL} + {V2_PARAMS} to {out_dir}")
 
 
 def _texts(path, ids):
@@ -940,7 +1177,9 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
     """Counts and real examples of every error type on held-out train entities (needs --stage fit first)."""
     owners = load_owners(data_dir)
     with open(os.path.join(out_dir, V2_PARAMS)) as fh:
-        params = json.load(fh)["params"]
+        saved = json.load(fh)
+    params, use_rec = saved["params"], saved.get("use_record_model", False)
+    weights = dict(zip(saved.get("evaluated_on", []), saved.get("decoy_weight", [])))
     train_dir = os.path.join(data_dir, "train")
     rng = np.random.default_rng(SEED)
     for country in list_caches(cache_dir, "train"):
@@ -955,10 +1194,11 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
             lines.append(msg)
 
         probs, idx, owner = np.load(pp), np.asarray(c["idx"]), owner_rows(c, owners)
+        score = np.load(os.path.join(c["dir"], "rec_oof.npy")) if use_rec else None
         n_s1, rows = c["meta"]["n_s1"], np.arange(len(idx))
-        e, stage = assign(idx, probs, c["is_s2"], n_s1, **params)
+        e, stage = assign(idx, probs, c["is_s2"], n_s1, **params, score=score)
         best = probs.argmax(axis=1)
-        pick, p_best = idx[rows, best], probs[rows, best]
+        pick, p_best = idx[rows, best], (probs[rows, best] if score is None else score)
         has = owner >= 0
         owner_rank = np.where((idx == owner[:, None]) & has[:, None], np.arange(TOP_K)[None, :], TOP_K).min(axis=1)
         in_top = owner_rank < TOP_K
@@ -966,13 +1206,14 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
         cats = {
             "correct link": has & (e == owner),
             "REJECTED: owner was the model's pick, below threshold": has & (e < 0) & in_top & (pick == owner),
-            "REJECTED: owner in top-10 but the model preferred another S1": has & (e < 0) & in_top & (pick != owner),
+            f"REJECTED: owner in top-{TOP_K} but the model preferred another S1": has & (e < 0) & in_top & (pick != owner),
             "WRONG LINK: assigned to a different S1": has & (e >= 0) & (e != owner),
-            "RETRIEVAL MISS: owner not in top-10, nothing assigned": has & ~in_top & (e < 0),
+            f"RETRIEVAL MISS: owner not in top-{TOP_K}, nothing assigned": has & ~in_top & (e < 0),
             "unowned record, correctly left alone": ~has & (e < 0),
             "FALSE LINK: unowned record assigned to an S1": ~has & (e >= 0),
         }
-        say(f"\n══════ ERROR ANALYSIS: train {country} (held-out predictions, params {params}) ══════")
+        say(f"\n══════ ERROR ANALYSIS: train {country} (held-out predictions, params {params}, "
+            f"{'record model' if use_rec else 'pair prob'} decides) ══════")
         say(f"{len(idx):,} records: {has.sum():,} owned, {(~has).sum():,} unowned; "
             f"{indic.mean():.1%} have an Indian-script name")
         say(f"{'category':62s} {'records':>10s} {'% of group':>10s} {'% Latin':>8s} {'% Indic':>8s} {'% S2':>6s}")
@@ -988,8 +1229,12 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
         sing = n_true == 0
         say(f"\nper-entity (leaderboard formula, as-is train world): mean F0.5 {Fe.mean():.4f} | "
             f"singletons {Fe[sing].mean():.3f} ({sing.sum():,}) | non-singletons {Fe[~sing].mean():.3f}")
+        wt = weights.get(country, 1.0)
+        Fw = entity_f05(e, owner, n_true, wt)
+        say(f"per-entity, test-like world (unowned false links x{wt:.2f}): mean F0.5 {Fw.mean():.4f} | "
+            f"singletons {Fw[sing].mean():.3f} | non-singletons {Fw[~sing].mean():.3f}")
         lost = 1 - Fe
-        say(f"points lost: {lost.sum() / len(Fe):.4f} total = singletons given a false link "
+        say(f"points lost (as-is): {lost.sum() / len(Fe):.4f} total = singletons given a false link "
             f"{lost[sing].sum() / len(Fe):.4f} + real entities scoring 0 {lost[~sing & (Fe == 0)].sum() / len(Fe):.4f} "
             f"+ partly-found real entities {lost[~sing & (Fe > 0)].sum() / len(Fe):.4f}")
 
@@ -1011,14 +1256,17 @@ def analyze_stage(data_dir, cache_dir, out_dir, n_examples):
                 return ""
             f = c["F"][i, r]
             return ("  ".join(f"{k}={float(f[COL[k]]):.0f}" for k in ("name_tset", "name_skel_tset", "addr_tset",
-                                                                      "addr_skel_tset", "score"))
-                    + "  " + "  ".join(f"{k}={float(f[COL[k]]):.2f}" for k in ("house_match", "seg_jacc")))
+                                                                      "addr_skel_tset", "score", "num_changed_q",
+                                                                      "num_changed_s"))
+                    + "  " + "  ".join(f"{k}={float(f[COL[k]]):.2f}" for k in ("house_match", "seg_jacc",
+                                                                               "legal_trans")))
 
         for name, sel in picks.items():
             say(f"\n── {name}: {len(sel)} random examples ──")
             for i in sel:
                 o, pk = owner[i], pick[i]
-                say(f"[{'S2' if c['is_s2'][i] else 'S3'}] best p={p_best[i]:.2f} stage={stage[i]} "
+                say(f"[{'S2' if c['is_s2'][i] else 'S3'}] best p={p_best[i]:.2f} "
+                    f"(pair p={probs[i, best[i]]:.2f}) stage={stage[i]} "
                     f"owner rank={'-' if owner_rank[i] >= TOP_K else owner_rank[i] + 1}")
                 say(f"   record : {fmt(rec_txt.get(rec_ids[i]))}")
                 if o >= 0:
@@ -1038,9 +1286,11 @@ def predict_stage(data_dir, cache_dir, out_dir, n_threads, overrides):
     model_path = os.path.join(out_dir, V2_MODEL)
     booster = lgb.Booster(model_file=model_path)
     with open(os.path.join(out_dir, V2_PARAMS)) as fh:
-        params = json.load(fh)["params"]
+        saved = json.load(fh)
+    params, use_rec = saved["params"], saved.get("use_record_model", False)
     params.update({k: v for k, v in overrides.items() if v is not None})
-    log(f"[predict] assignment params: {params}")
+    rec_booster = lgb.Booster(model_file=os.path.join(out_dir, REC_MODEL)) if use_rec else None
+    log(f"[predict] assignment params: {params}; decided by {'record model' if use_rec else 'pair prob'}")
 
     test_dir = os.path.join(data_dir, "test")
     missing = set(list_countries(os.path.join(test_dir, "test_source1.tsv"))) - set(list_caches(cache_dir, "test"))
@@ -1060,7 +1310,8 @@ def predict_stage(data_dir, cache_dir, out_dir, n_threads, overrides):
             np.save(probs_path, probs)
         idx = np.asarray(c["idx"])
         n_s1 = c["meta"]["n_s1"]
-        e, stage = assign(idx, probs, c["is_s2"], n_s1, **params)
+        score = record_scores(rec_booster, c, probs, n_threads) if use_rec else None
+        e, stage = assign(idx, probs, c["is_s2"], n_s1, **params, score=score)
         s1_ids = np.array(c["s1_ids"].to_list(), dtype=object)
         rec_ids = np.array(c["rec_ids"].to_list(), dtype=object)
         a = e >= 0
@@ -1101,10 +1352,10 @@ def main():
     ap.add_argument("--countries", default="", help="v2 extract: comma-separated, e.g. India,US (default: all)")
     ap.add_argument("--sample", type=int, default=0, help="v2 extract: only this many random records per country")
     ap.add_argument("--max-df", type=float, default=V2_MAX_DF, help="v2 extract: BM25 common-word cutoff")
-    ap.add_argument("--fit-sample", type=int, default=600_000, help="v2 fit: records per train cache used for fitting")
-    ap.add_argument("--noise-shift", type=float, default=0.19,
-                    help="v2 fit: share of S1 removed from the train world before tuning, so ~40%% of records are "
-                         "unowned like test (0 = tune on the train world as-is)")
+    ap.add_argument("--fit-sample", type=int, default=1_500_000, help="v2 fit: records per train cache used for fitting")
+    ap.add_argument("--decoy-weight", type=float, default=0,
+                    help="v2 fit: weight of false links made by unowned records when tuning (test has ~2x the "
+                         "unowned records per S1 of train); 0 = derive it from the train and test caches")
     ap.add_argument("--t-high", type=float, help="v2 predict: override the tuned threshold for stage A")
     ap.add_argument("--t-sib", type=float, help="v2 predict: override stage B threshold")
     ap.add_argument("--t-first", type=float, help="v2 predict: override stage C threshold")
@@ -1122,7 +1373,7 @@ def main():
     elif args.stage == "vocab":
         vocab_stage(args.data_dir, args.out_dir, args.vocab_pairs)
     elif args.stage == "fit":
-        fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs, args.noise_shift)
+        fit_stage(args.data_dir, cache_dir, args.out_dir, args.fit_sample, args.n_jobs, args.decoy_weight)
     elif args.stage == "analyze":
         analyze_stage(args.data_dir, cache_dir, args.out_dir, args.examples)
     elif args.stage == "predict":

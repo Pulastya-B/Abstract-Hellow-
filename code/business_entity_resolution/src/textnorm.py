@@ -93,6 +93,15 @@ def indic_to_latin(s):
     return "".join(out)
 
 
+_LATIN_MARKS = re.compile(r"[\u0300-\u036f]")
+
+
+def strip_latin_accents(s):
+    """'ÀMICALE' -> 'AMICALE', 'Límited' -> 'Limited'. Only Latin combining marks are removed, so Indian
+    scripts (whose vowel signs are also combining marks) keep their spelling."""
+    return _LATIN_MARKS.sub("", unicodedata.normalize("NFKD", s)) if s else s
+
+
 _NON_ALNUM = re.compile(r"[^a-z0-9 ]+")
 _REPEAT = re.compile(r"(.)\1+")
 _FOLD = (("ph", "f"), ("w", "v"), ("ck", "k"), ("c", "k"), ("q", "k"), ("x", "ks"), ("z", "j"),
@@ -128,15 +137,24 @@ def skeleton(s):
 
 _FILLER = {
     "pvt", "private", "ltd", "limited", "llp", "llc", "inc", "incorporated", "corp", "corporation", "co", "company",
-    "sarl", "sas", "sasu", "sa", "eurl", "snc", "ei", "center", "centre", "mr", "mrs", "ms", "m", "s", "the", "and",
-    "of", "www", "com", "net", "org", "india", "france", "usa", "us",
+    "sarl", "sas", "sasu", "sa", "eurl", "snc", "sci", "cie", "ei", "center", "centre", "mr", "mrs", "ms", "m", "s",
+    "the", "and", "of", "www", "com", "net", "org", "india", "france", "usa", "us",
 }
 _DOMAIN = re.compile(r"\.(?:co\.in|com|in|net|org|biz|info|fr|us)\b")
+_DOTTED = re.compile(r"(?<![a-z0-9])[a-z](?:\.[a-z])+\.?(?![a-z0-9])")
+
+
+def _undot_legal(s):
+    """'e.u.r.l.' -> 'eurl', 's.a.s' -> 'sas'; other dotted initials ('r.k.') are left alone."""
+    def fix(m):
+        t = m.group().replace(".", "")
+        return t if t in _FILLER else m.group()
+    return _DOTTED.sub(fix, s)
 
 
 def name_core(name):
     """Distinctive name tokens, in order, deduplicated: legal forms, fillers, domains and numbers removed."""
-    s = _DOMAIN.sub(" ", ascii_fold(name).replace("www.", " "))
+    s = _DOMAIN.sub(" ", _undot_legal(ascii_fold(name)).replace("www.", " "))
     seen, out = set(), []
     for t in _NON_ALNUM.sub(" ", s).split():
         if t not in _FILLER and not t.isdigit() and t not in seen:
@@ -209,6 +227,80 @@ def has_repeated_word(name):
     return any(a == b for a, b in zip(w, w[1:]))
 
 
+# Legal form as a class. Measured on train India: a true record keeps its S1's class 92.1% of the time
+# (the common change is "Private Limited" -> "Limited"), a sibling business at the same address only 74.3%.
+_LEGAL_TOK = {
+    "llp": "llp", "llc": "llc", "inc": "inc", "incorporated": "inc", "pvt": "pvt", "private": "pvt", "pvtltd": "pvt",
+    "ltd": "ltd", "limited": "ltd", "corp": "corp", "corporation": "corp", "sarl": "sarl", "sasu": "sasu",
+    "sas": "sas", "eurl": "eurl", "sa": "sa", "sci": "sci", "snc": "snc", "co": "co", "company": "co", "cie": "co",
+    # transliterated from Indian scripts (see the noise vocabulary: "praivet", "praibhet", "piraivet")
+    "praivet": "pvt", "praibhet": "pvt", "piraivet": "pvt", "praivat": "pvt", "limitet": "ltd", "limited": "ltd",
+}
+_FILLER.update(_LEGAL_TOK)
+_LEGAL_ORDER = ["llp", "llc", "inc", "pvt", "ltd", "corp", "sarl", "sasu", "sas", "eurl", "sa", "sci", "snc", "co"]
+
+
+def legal_form(name):
+    """Legal-form class of a business name ('pvt', 'llp', 'sarl', ...), '' if none."""
+    found = {_LEGAL_TOK[t] for t in _NON_ALNUM.sub(" ", _undot_legal(ascii_fold(name))).split() if t in _LEGAL_TOK}
+    return next((c for c in _LEGAL_ORDER if c in found), "")
+
+
+# ── numbers ──────────────────────────────────────────────────────────────────
+#
+# Unowned records are mostly generated sibling businesses: same street as a real S1 entity, house number
+# CHANGED (582 -> 595). Measured on train India, same street: a number substituted in 70.6% of siblings vs
+# 1.2% of true pairs, whose number noise is dropping/adding digits or whole numbers (1093 vs 01093, 13 vs 9-13).
+
+_NUM = re.compile(r"\d+")
+
+
+def numbers(addr):
+    """Numbers in an address, leading zeros dropped, Indian-script digits folded to ASCII."""
+    return [n.lstrip("0") or "0" for n in _NUM.findall(ascii_fold(addr))] if addr else []
+
+
+def number_compare(a, b):
+    """-> (record numbers unrelated to every S1 number, the same from the S1 side, presence 0-3).
+    'Related' = equal or one contains the other, which is how the noise drops/adds digits."""
+    presence = float((1 if a else 0) + (2 if b else 0))
+    if not a or not b:
+        return -1.0, -1.0, presence
+    ca = sum(1 for x in set(a) if not any(x in y or y in x for y in b))
+    cb = sum(1 for y in set(b) if not any(x in y or y in x for x in a))
+    return float(ca), float(cb), presence
+
+
+def is_subsequence(a, b):
+    it = iter(b)
+    return all(ch in it for ch in a)
+
+
+# ── addresses: abbreviations ─────────────────────────────────────────────────
+
+_ABBR_DEFAULT = {
+    "rd": "road", "st": "street", "ave": "avenue", "av": "avenue", "blvd": "boulevard", "ln": "lane", "ste": "suite",
+    "apt": "apartment", "flr": "floor", "fl": "floor", "bldg": "building", "nr": "near", "opp": "opposite",
+    "hwy": "highway", "pkwy": "parkway", "sq": "square", "extn": "extension", "ext": "extension", "sec": "sector",
+    "cir": "circle", "twr": "tower", "plz": "plaza",
+}
+_ABBR = {
+    "France": {
+        "r": "rue", "av": "avenue", "ave": "avenue", "bd": "boulevard", "blvd": "boulevard", "boul": "boulevard",
+        "all": "allee", "al": "allee", "imp": "impasse", "ch": "chemin", "chem": "chemin", "pl": "place",
+        "rte": "route", "crs": "cours", "fg": "faubourg", "fbg": "faubourg", "sq": "square", "pte": "porte",
+        "res": "residence", "st": "saint", "ste": "sainte", "qu": "quai",
+    },
+}
+_WORD = re.compile(r"\b[a-z]+\b")
+
+
+def expand_abbrev(text, country):
+    """Street-type abbreviations to full words ('63 r. de dieppe' -> '63 rue. de dieppe'); expects lowercase."""
+    abbr = _ABBR.get(country, _ABBR_DEFAULT)
+    return _WORD.sub(lambda m: abbr.get(m.group(), m.group()), text)
+
+
 # ── addresses ────────────────────────────────────────────────────────────────
 
 _HOUSE = re.compile(r"\d+[a-z]?(?:\s*[-/]\s*\d+[a-z]?)*")
@@ -276,10 +368,16 @@ def address_parts(addr, country):
         # numbers are compared separately (house number, postal), so segments keep only words
         t = " ".join(w for w in _NON_ALNUM.sub(" ", ascii_fold(raw)).split() if not any(c.isdigit() for c in w))
         if t:
-            segs.append(states.get(t.replace(" ", ""), t))
+            key = t.replace(" ", "")
+            segs.append(states[key] if key in states else expand_abbrev(t, country))
     # the state is wherever a known state name appears (addresses get reordered: "TX, DALLAS"),
-    # else the last segment (regions/native-script states still line up via their skeleton)
-    state = next((s for s in reversed(segs) if s in state_names), segs[-1] if segs else "")
+    # else the last segment (regions/native-script states still line up via their skeleton).
+    # No state list for the country (France): unknown. The "last segment" guess said "different state"
+    # for 73% of near-certain France matches (India 8%, US 0.2%), which the model reads as a mismatch.
+    if states:
+        state = next((s for s in reversed(segs) if s in state_names), segs[-1] if segs else "")
+    else:
+        state = ""
     # postal codes are searched after the first segment, so a 5-digit US house number isn't one
     rest = addr.split(",", 1)[1] if "," in addr else ""
     m = _POSTAL.get(country, _POSTAL["France"]).findall(rest)
