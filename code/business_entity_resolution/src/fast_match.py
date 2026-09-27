@@ -58,9 +58,9 @@ from rapidfuzz.utils import default_process
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
-from textnorm import (address_parts, core_compare, core_extras, expand_abbrev, has_repeated_word, house_match,
-                      is_subsequence, legal_form, name_core, noise_evidence, number_compare, numbers, skeleton,
-                      strip_latin_accents)
+from textnorm import (address_parts, ascii_fold, core_compare, core_extras, expand_abbrev, has_repeated_word,
+                      house_match, house_number, is_subsequence, legal_form, name_core, noise_evidence, number_compare,
+                      numbers, segment, skeleton, strip_latin_accents, unleet)
 
 TOKEN_PATTERN = r"(?u)\b\w+\b"
 MAX_DF = 0.05           # drop tokens in >5% of a country's S1 docs ("road", state codes, "pvt")
@@ -121,6 +121,139 @@ def list_countries(path):
         pl.scan_csv(path, separator="\t", infer_schema_length=0, quote_char=None)
         .select("country").unique().drop_nulls().collect()["country"].to_list()
     )
+
+
+# ── record cleanup, applied to S2/S3 names/addresses before retrieval and features ──
+#
+# Indian-script names are word-for-word transliterations of the English name (100% of train pairs have the
+# same token count, and each English word has one spelling per script: सदर्न = southern, सिटी = city), so
+# a dictionary learned from train pairs turns them back into the English name exactly. Words it has never
+# seen fall back to transliteration, snapped to an S1 word with the same consonant skeleton.
+
+INDIC_RUN = re.compile("[\\u0900-\\u0DFF\\u200c\\u200d]+")
+_DOMAIN_SUFFIX = re.compile(r"(?i)\.(?:co\.in|com|in|net|org|biz|info|fr|us)\b|\bwww\.")
+_HANDLE = re.compile(r"(?:(?<=\s)|^)[@#]+")
+_LONG_WORD = re.compile(r"[a-z]{7,}")
+_ID_TAG = re.compile(r"(?i)\(?\bid\s*[:#]\s*\d+\)?")
+
+
+class RecordCleaner:
+    def __init__(self, s1_names, indic_name=None, indic_addr=None):
+        counts = {}
+        for n in s1_names:
+            for t in re.findall(r"[a-z]+", strip_latin_accents(n).lower()):
+                if len(t) >= 2:
+                    counts[t] = counts.get(t, 0) + 1
+        tot = max(sum(counts.values()), 1)
+        # segmentation vocabulary: words seen in 5+ S1 names, so rare/typo tokens can't be glue pieces;
+        # any word some S1 name uses as-is ("navinchandra") is never split
+        self.vocab = {t: -float(np.log(c / tot)) for t, c in counts.items() if c >= 5}
+        self.known = set(counts)
+        skel = {}
+        for t, c in counts.items():
+            k = skeleton(t)
+            if len(k) >= 3 and c > skel.get(k, ("", 0))[1]:
+                skel[k] = (t, c)
+        self.skel = {k: v[0] for k, v in skel.items()}
+        self.indic_name = indic_name or {}
+        self.indic_addr = indic_addr or {}
+
+    def _native(self, run, table):
+        if run in table:
+            return table[run]
+        lat = re.sub(r"[^a-z0-9]", "", ascii_fold(run))
+        if not lat or lat in self.vocab:
+            return lat or run
+        return self.skel.get(skeleton(lat), lat)
+
+    def name(self, s):
+        if not s:
+            return s
+        s = INDIC_RUN.sub(lambda m: " " + self._native(m.group(), self.indic_name) + " ", s)
+        s = _HANDLE.sub("", _DOMAIN_SUFFIX.sub(" ", unleet(_ID_TAG.sub(" ", s))))
+
+        def split(m):
+            w = m.group()
+            if w in self.known:
+                return w
+            parts = segment(w, self.vocab)
+            return " ".join(parts) if parts else w
+        return " ".join(_LONG_WORD.sub(split, strip_latin_accents(s).lower()).split())
+
+    def addr(self, s):
+        if not s:
+            return s
+        s = _ADDR_JUNK.sub(" ", s)
+        return INDIC_RUN.sub(lambda m: self._native(m.group(), self.indic_addr), s)
+
+
+_ADDR_JUNK = re.compile(r"(?i)<\s*null\s*>|\bnull\b|\bn/a\b|(?<=#)#+")
+
+
+def clean_records(q, s1, vocab):
+    """Cleaned copy of q (names/addresses); q_nonlatin is kept from the original name."""
+    rc = RecordCleaner(s1["business_name"].to_list(), vocab.get("indic_name"), vocab.get("indic_addr"))
+    return q.with_columns(
+        pl.Series("orig_nonlatin", [_nonlatin(x) for x in q["business_name"].to_list()], dtype=pl.Float32),
+        pl.Series("business_name", [rc.name(x) for x in q["business_name"].to_list()]),
+        pl.Series("business_address", [rc.addr(x) for x in q["business_address"].to_list()]),
+    )
+
+
+def learn_indic(data_dir, owners, min_count=2, max_addr_pairs=400_000):
+    """Native-script word -> English word, from train true pairs (see RecordCleaner)."""
+    train_dir = os.path.join(data_dir, "train")
+    pat = "[\\u0900-\\u0DFF]"
+    recs = pl.concat([
+        pl.scan_csv(os.path.join(train_dir, f), separator="\t", infer_schema_length=0, quote_char=None)
+        .select("entity_id", pl.col("business_name").fill_null(""), pl.col("business_address").fill_null(""))
+        .filter(pl.col("business_name").str.contains(pat) | pl.col("business_address").str.contains(pat)).collect()
+        for f in ("train_source2.tsv", "train_source3.tsv")])
+    s1 = (pl.scan_csv(os.path.join(train_dir, "train_source1.tsv"), separator="\t", infer_schema_length=0,
+                      quote_char=None)
+          .select(pl.col("entity_id").alias("owner"), pl.col("business_name").fill_null("").alias("sn"),
+                  pl.col("business_address").fill_null("").alias("sa")).collect())
+    p = recs.join(owners.rename({"cand_id": "entity_id"}), on="entity_id").join(s1, on="owner")
+    names = {}
+    for rn, sn in zip(p["business_name"].to_list(), p["sn"].to_list()):
+        a, b = rn.split(), sn.split()
+        if len(a) != len(b) or not INDIC_RUN.search(rn):
+            continue
+        for x, y in zip(a, b):
+            runs = INDIC_RUN.findall(x)
+            y = re.sub(r"[^a-z0-9&]", "", strip_latin_accents(y).lower())
+            if len(runs) == 1 and y:
+                d = names.setdefault(runs[0], {})
+                d[y] = d.get(y, 0) + 1
+    indic_name = {}
+    for run, d in names.items():
+        tot = sum(d.values())
+        w, c = max(d.items(), key=lambda x: x[1])
+        if tot >= min_count and c >= 0.6 * tot:
+            indic_name[run] = w
+    # addresses are not word-aligned: pick the S1 address word that co-occurs with the native word most
+    # reliably, breaking ties by how close the transliteration sounds ("मुंबई" -> mumbai, not maharashtra)
+    cnt, co = {}, {}
+    pa = p.filter(pl.col("business_address").str.contains(pat))
+    if pa.height > max_addr_pairs:
+        pa = pa.sample(n=max_addr_pairs, seed=SEED)
+    for ra, sa in zip(pa["business_address"].to_list(), pa["sa"].to_list()):
+        eng = set(re.findall(r"[a-z]+", strip_latin_accents(sa).lower()))
+        for run in set(INDIC_RUN.findall(ra)):
+            cnt[run] = cnt.get(run, 0) + 1
+            d = co.setdefault(run, {})
+            for e in eng:
+                d[e] = d.get(e, 0) + 1
+    indic_addr = {}
+    for run, n in cnt.items():
+        if n < 5:
+            continue
+        sk = skeleton(ascii_fold(run))
+        good = [(fuzz.ratio(sk, skeleton(e)), e) for e, c in co[run].items() if c >= 0.5 * n and len(e) >= 2]
+        good = [g for g in good if g[0] >= 50]
+        if good:
+            indic_addr[run] = max(good)[1]
+    return indic_name, indic_addr
 
 
 def _country_of(df):
@@ -300,7 +433,7 @@ def _topk(Q, inj=None):
     return idx, sc
 
 
-def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
+def _pair_features(q_names, q_addrs, q_is_s2, idx, sc, q_nonlat=None):
     n = idx.shape[0]
     F = np.zeros((n, TOP_K, len(PAIR_FEATURES)), dtype=np.float32)
     valid = idx >= 0
@@ -340,7 +473,7 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
         a_hdig = re.sub(r"\D", "", a_house)
         low = q_names[i].lower()
         F[i, :, COL["q_addr_empty"]] = float(a_empty)
-        F[i, :, COL["q_nonlatin"]] = _nonlatin(q_names[i])
+        F[i, :, COL["q_nonlatin"]] = _nonlatin(q_names[i]) if q_nonlat is None else q_nonlat[i]
         F[i, :, COL["q_domain"]] = float("www." in low or ".com" in low or ".in" in low)
         F[i, :, COL["q_dup_word"]] = float(has_repeated_word(q_names[i]))
         for r in range(TOP_K):
@@ -419,9 +552,9 @@ def _pair_features(q_names, q_addrs, q_is_s2, idx, sc):
 
 
 def _process_chunk(task):
-    Q, q_names, q_addrs, q_is_s2, inj = task
+    Q, q_names, q_addrs, q_is_s2, inj, q_nonlat = task
     idx, sc = _topk(Q, inj)
-    F = _pair_features(q_names, q_addrs, q_is_s2, idx, sc)
+    F = _pair_features(q_names, q_addrs, q_is_s2, idx, sc, q_nonlat)
     booster = _W["booster"]
     if booster is None:
         return idx, sc, F
@@ -436,8 +569,10 @@ def iter_chunks(Q, q, XT, s1, n_jobs, model_path, desc, vocab=None, inj=None):
     qn, qa = q["business_name"].to_list(), q["business_address"].to_list()
     qs2 = (q["src"] == "S2").to_numpy().astype(np.float32)
     starts = list(range(0, q.height, TASK_CHUNK))
+    qnl = q["orig_nonlatin"].to_numpy() if "orig_nonlatin" in q.columns else None
     tasks = [(Q[s:s + TASK_CHUNK], qn[s:s + TASK_CHUNK], qa[s:s + TASK_CHUNK], qs2[s:s + TASK_CHUNK],
-              None if inj is None else inj[s:s + TASK_CHUNK]) for s in starts]
+              None if inj is None else inj[s:s + TASK_CHUNK], None if qnl is None else qnl[s:s + TASK_CHUNK])
+             for s in starts]
     country = s1["country"][0] if s1.height else ""
     initargs = (XT, s1["business_name"].to_list(), s1["business_address"].to_list(), model_path, country, vocab)
     if n_jobs <= 1:
@@ -694,10 +829,14 @@ def extract_stage(data_dir, cache_dir, split, countries, n_jobs, sample, max_df,
         sampled = bool(sample) and q.height > sample
         if sampled:
             q = q.sample(n=sample, seed=SEED)
+        q = clean_records(q, s1, vocab)
         n = q.height
         log(f"[extract {split} {country}] index {s1.height:,} S1 (max_df={max_df}), "
             f"{'a sample of' if sampled else 'ALL'} {n:,} S2/S3 records")
-        q.select(pl.col("entity_id").alias("rec_id"), "src").write_parquet(os.path.join(out, "records.parquet"))
+        # house number (digits only) of each record, for the record model's peer features
+        q.select(pl.col("entity_id").alias("rec_id"), "src",
+                 pl.Series("house", [re.sub(r"\D", "", house_number(a)) for a in q["business_address"].to_list()])
+                 ).write_parquet(os.path.join(out, "records.parquet"))
         s1.select("entity_id").write_parquet(os.path.join(out, "s1.parquet"))
         # written chunk by chunk as results arrive, so the full feature tensor never sits in RAM
         idx_mm = np.lib.format.open_memmap(os.path.join(out, "idx.npy"), mode="w+", dtype=np.int32, shape=(n, TOP_K))
@@ -732,6 +871,9 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
     """
     train_dir = os.path.join(data_dir, "train")
     owners = load_owners(data_dir)
+    indic_name, indic_addr = learn_indic(data_dir, owners)
+    log(f"[vocab] Indian-script dictionary: {len(indic_name):,} name words, {len(indic_addr):,} address words "
+        f"(e.g. {', '.join(f'{k}={v}' for k, v in list(indic_name.items())[:6])})")
     if owners.height > n_pairs:
         owners = owners.sample(n=n_pairs, seed=SEED)
 
@@ -747,6 +889,11 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
     pairs = (owners.join(recs.rename({"business_name": "rn"}), on="cand_id")
              .join(s1.rename({"business_name": "sn"}), on="owner"))
     log(f"[vocab] learning noise vocabulary from {pairs.height:,} train true pairs")
+    # the noise words are learned on CLEANED record names, the form every later stage sees
+    all_s1 = pl.scan_csv(os.path.join(train_dir, "train_source1.tsv"), separator="	", infer_schema_length=0,
+                         quote_char=None).select(pl.col("business_name").fill_null("")).collect()
+    rc = RecordCleaner(all_s1["business_name"].to_list(), indic_name, indic_addr)
+    pairs = pairs.with_columns(pl.Series("rn", [rc.name(x) for x in pairs["rn"].to_list()]))
 
     added, dropped, rec_tok, s1_tok, legal_pair, legal_s1 = {}, {}, {}, {}, {}, {}
 
@@ -770,7 +917,8 @@ def vocab_stage(data_dir, out_dir, n_pairs, min_count=30):
              "dropped": {t: dropped.get(t, 0) / c for t, c in s1_tok.items() if c >= min_count},
              # P(record's legal form | S1's legal form) on true pairs: "pvt>ltd" is common noise, "ltd>llp" is not
              "legal": {k: c / legal_s1[k.split(">")[0]] for k, c in legal_pair.items()
-                       if legal_s1[k.split(">")[0]] >= min_count}}
+                       if legal_s1[k.split(">")[0]] >= min_count},
+             "indic_name": indic_name, "indic_addr": indic_addr}
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, VOCAB_FILE), "w") as fh:
         json.dump(vocab, fh)
@@ -822,6 +970,7 @@ def load_cache(cache_dir, split, country, data_dir):
     cache = {
         "dir": p, "meta": meta, "country": country,
         "rec_ids": recs["rec_id"], "is_s2": (recs["src"] == "S2").to_numpy(),
+        "house": np.where(recs["house"] == "", 0, recs["house"].hash().to_numpy().astype(np.int64) | 1),
         "s1_ids": pl.read_parquet(os.path.join(p, "s1.parquet"))["entity_id"],
         "idx": np.load(os.path.join(p, "idx.npy"), mmap_mode="r"),
         "F": np.load(os.path.join(p, "F.npy"), mmap_mode="r"),
@@ -1014,12 +1163,61 @@ def _fit_pairs(parts, mask_fn, n_threads, label):
 
 
 REC_MODEL = "fast_recmodel_v2.txt"
-REC_BASE = ["p1", "p2", "p3", "p_gap12", "p_sum", "n_p50", "pick_rank", "n_valid"]
+PEER_FEATURES = ["peer_claims", "peer_other_src", "peer_same_house", "peer_max_p"]
+REC_BASE = ["p1", "p2", "p3", "p_gap12", "p_sum", "n_p50", "pick_rank", "n_valid"] + PEER_FEATURES
 REC_FEATURES = REC_BASE + [f"best_{f}" for f in MODEL_FEATURES] + [f"second_{f}" for f in MODEL_FEATURES]
 REC_PARAMS = dict(n_estimators=600, num_leaves=63, min_child_samples=200, colsample_bytree=0.8)
 
 
-def record_features(cache, probs):
+def peer_features(cache, probs):
+    """
+    (records, PEER_FEATURES): what the OTHER records that pick the same S1 (pair p >= 0.5) say. A true record
+    whose number disagrees with its S1 is often backed by another record with the same number (the S1 copy is
+    the noisy one: 41% of such deviations repeat within the entity), while a sibling decoy stands alone (2%).
+    NaN for a sampled cache, where most of an entity's records are missing.
+    """
+    n = len(probs)
+    if cache["meta"]["sampled"]:
+        return np.full((n, len(PEER_FEATURES)), np.nan, dtype=np.float32)
+    idx = np.asarray(cache["idx"])
+    rows = np.arange(n)
+    b = probs.argmax(axis=1)
+    e = idx[rows, b].astype(np.int64)
+    p = probs[rows, b]
+    n_s1 = cache["meta"]["n_s1"]
+    ok = e >= 0
+    ec = np.where(ok, e, 0)
+    claim = ok & (p >= 0.5)
+    s2 = cache["is_s2"]
+    cnt = np.bincount(e[claim], minlength=n_s1)
+    c2 = np.bincount(e[claim & s2], minlength=n_s1)
+    c3 = np.bincount(e[claim & ~s2], minlength=n_s1)
+    peer_claims = cnt[ec] - claim
+    peer_other = np.where(s2, c3[ec], c2[ec])
+    h = cache["house"]
+    key = (ec.astype(np.uint64) << np.uint64(32)) | (h.astype(np.uint64) & np.uint64(0xFFFFFFFF))
+    hc = claim & (h != 0)
+    uk, uc = np.unique(key[hc], return_counts=True)
+    pos = np.clip(np.searchsorted(uk, key), 0, max(len(uk) - 1, 0))
+    same = np.where(uk[pos] == key, uc[pos], 0) if len(uk) else np.zeros(n, dtype=np.int64)
+    peer_same = np.where(ok & (h != 0), same - hc, -1)
+    # best and second-best claim probability per S1; a record sees the best one that isn't itself
+    ci = np.where(claim)[0]
+    order = ci[np.lexsort((-p[ci], e[ci]))]
+    first = np.r_[True, e[order][1:] != e[order][:-1]] if len(order) else np.zeros(0, bool)
+    max1 = np.zeros(n_s1, dtype=np.float32)
+    max2 = np.zeros(n_s1, dtype=np.float32)
+    top_rec = np.zeros(n, dtype=bool)
+    max1[e[order[first]]] = p[order[first]]
+    top_rec[order[first]] = True
+    np.maximum.at(max2, e[order[~first]], p[order[~first]])
+    peer_max = np.where(top_rec, max2[ec], max1[ec])
+    out = np.column_stack([peer_claims, peer_other, peer_same, peer_max]).astype(np.float32)
+    out[~ok] = 0
+    return out
+
+
+def record_features(cache, probs, peer=None):
     """
     One row per record for the record-level model: how the pair model's probability is spread over the
     record's candidates, plus the full feature rows of its top-2 candidates. It learns when a confident pick
@@ -1028,8 +1226,11 @@ def record_features(cache, probs):
     """
     idx_mm, F_mm = cache["idx"], cache["F"]
     n = len(probs)
+    if peer is None:
+        peer = peer_features(cache, probs)
     out = np.zeros((n, len(REC_FEATURES)), dtype=np.float32)
     nb = len(REC_BASE)
+    npf = len(PEER_FEATURES)
     nf = len(MODEL_FEATURES)
     for s in range(0, n, PREDICT_CHUNK):
         e = min(n, s + PREDICT_CHUNK)
@@ -1043,8 +1244,9 @@ def record_features(cache, probs):
         b2 = P2.argmax(axis=1)
         top = -np.sort(-P, axis=1)[:, :3]
         o = out[s:e]
-        o[:, :nb] = np.column_stack([top[:, 0], top[:, 1], top[:, 2], top[:, 0] - top[:, 1], P.sum(axis=1),
-                                     (P > 0.5).sum(axis=1), b, (ix >= 0).sum(axis=1)])
+        o[:, :nb - npf] = np.column_stack([top[:, 0], top[:, 1], top[:, 2], top[:, 0] - top[:, 1], P.sum(axis=1),
+                                           (P > 0.5).sum(axis=1), b, (ix >= 0).sum(axis=1)])
+        o[:, nb - npf:nb] = peer[s:e]
         o[:, nb:nb + nf] = F[r, b]
         o[:, nb + nf:] = F[r, b2]
     return out
@@ -1052,10 +1254,11 @@ def record_features(cache, probs):
 
 def record_scores(booster, cache, probs, n_threads=0):
     out = np.zeros(len(probs), dtype=np.float32)
+    peer = peer_features(cache, probs)
     for s in range(0, len(probs), PREDICT_CHUNK):
         e = min(len(probs), s + PREDICT_CHUNK)
         sub = {**cache, "idx": cache["idx"][s:e], "F": cache["F"][s:e]}
-        out[s:e] = booster.predict(record_features(sub, probs[s:e]), num_threads=n_threads)
+        out[s:e] = booster.predict(record_features(sub, probs[s:e], peer[s:e]), num_threads=n_threads)
     return out
 
 

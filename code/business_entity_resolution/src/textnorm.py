@@ -276,6 +276,46 @@ def is_subsequence(a, b):
     return all(ch in it for ch in a)
 
 
+# ── record-name cleanup: leetspeak, glued domain/handle names ────────────────
+#
+# Retrieval misses on train India (40K owned records): after Indian-script and no-address records, most are
+# names glued into a domain or handle ("foundationunitedprivate.com" = United Foundation Private Limited,
+# "@si1versolution", "Hardiktraderscom"), which word-level BM25 cannot match at all.
+
+_LEET = {"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t"}
+_LEET_RE = re.compile(r"(?<=[A-Za-z])[013457](?=[A-Za-z])|(?<=[A-Za-z]{3})[013457]\b|\b[013457](?=[A-Za-z]{3})")
+
+
+def unleet(s):
+    """'si1ver' -> 'silver', 'Ind0' -> 'Indo', '5hakti' -> 'shakti': digits between letters, ending a 3+ letter
+    word, or starting one ('4Th', '1St' are left alone)."""
+    return _LEET_RE.sub(lambda m: _LEET[m.group()], s)
+
+
+def segment(word, vocab, max_len=20):
+    """Split a glued lowercase word into common known words (vocab: word -> cost, lower is more common), or
+    None. Every piece must be a known word of 3+ letters (one 2-letter piece allowed), so typos and made-up
+    trade names ('lgisstics', 'veohalosol') are left whole instead of being cut into junk."""
+    n = len(word)
+    best = [0.0] + [float("inf")] * n
+    back = [0] * (n + 1)
+    for i in range(1, n + 1):
+        for j in range(max(0, i - max_len), i):
+            c = vocab.get(word[j:i])
+            if c is not None and i - j >= 2 and best[j] + c < best[i]:
+                best[i], back[i] = best[j] + c, j
+    if best[n] == float("inf"):
+        return None
+    parts, i = [], n
+    while i > 0:
+        parts.append(word[back[i]:i])
+        i = back[i]
+    parts.reverse()
+    if len(parts) < 2 or sum(len(p) == 2 for p in parts) > 1:
+        return None
+    return parts
+
+
 # ── addresses: abbreviations ─────────────────────────────────────────────────
 
 _ABBR_DEFAULT = {
